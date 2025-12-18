@@ -34,7 +34,11 @@ NON_SQL_INTENT_TYPES: List[str] = [
 
 # Database type sets for categorization
 SQL_TYPES = {"postgresql", "mysql", "mariadb", "sqlserver", "oracle"}
+CLOUD_WAREHOUSE_TYPES = {"snowflake", "bigquery", "redshift", "synapse", "databricks"}
 NOSQL_TYPES = {"mongodb", "cassandra", "redis", "dynamodb", "elasticsearch"}
+
+# All SQL-based types (including cloud warehouses)
+ALL_SQL_TYPES = SQL_TYPES | CLOUD_WAREHOUSE_TYPES
 
 # Database type mappings (lowercase to proper name)
 SQL_TYPE_MAP: Dict[str, str] = {
@@ -43,6 +47,14 @@ SQL_TYPE_MAP: Dict[str, str] = {
     "mariadb": "MariaDB",
     "sqlserver": "SQL Server",
     "oracle": "Oracle"
+}
+
+CLOUD_WAREHOUSE_TYPE_MAP: Dict[str, str] = {
+    "snowflake": "Snowflake",
+    "bigquery": "BigQuery",
+    "redshift": "Redshift",
+    "synapse": "Synapse",
+    "databricks": "Databricks"
 }
 
 NON_SQL_TYPE_MAP: Dict[str, str] = {
@@ -60,6 +72,14 @@ SQL_DIALECT_MAP: Dict[str, str] = {
     "mariadb": "mariadb",
     "sqlserver": "sqlserver",
     "oracle": "oracle"
+}
+
+CLOUD_WAREHOUSE_DIALECT_MAP: Dict[str, str] = {
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "redshift": "redshift",
+    "synapse": "sqlserver",  # Synapse uses SQL Server dialect
+    "databricks": "databricks"
 }
 
 NON_SQL_DIALECT_MAP: Dict[str, str] = {
@@ -114,6 +134,54 @@ SQL_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
     }
 }
 
+CLOUD_WAREHOUSE_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "snowflake": {
+        "query": "SELECT column1, column2 FROM database.schema.table WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM table GROUP BY column",
+        "join": "SELECT * FROM table1 t1 JOIN table2 t2 ON t1.id = t2.id",
+        "masking": "CASE WHEN condition THEN column ELSE CONCAT(LEFT(column, 3), '***') END",
+        "string_functions": "CONCAT, LEFT, RIGHT, SUBSTRING, REPLACE, UPPER, LOWER, TRIM",
+        "date_functions": "DATE_TRUNC, DATEDIFF, DATEADD, CURRENT_DATE(), CURRENT_TIMESTAMP()",
+        "warehouse_functions": "QUALIFY (window functions), PIVOT, UNPIVOT, LATERAL FLATTEN"
+    },
+    "bigquery": {
+        "query": "SELECT column1, column2 FROM `project.dataset.table` WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM table GROUP BY column",
+        "join": "SELECT * FROM table1 t1 JOIN table2 t2 ON t1.id = t2.id",
+        "masking": "CASE WHEN condition THEN column ELSE CONCAT(SUBSTR(column, 1, 3), '***') END",
+        "string_functions": "CONCAT, SUBSTR, REPLACE, UPPER, LOWER, TRIM, REGEXP_REPLACE",
+        "date_functions": "DATE_TRUNC, DATE_DIFF, DATE_ADD, CURRENT_DATE(), CURRENT_TIMESTAMP()",
+        "warehouse_functions": "ARRAY_AGG, STRUCT, UNNEST, APPROX_COUNT_DISTINCT, PIVOT"
+    },
+    "redshift": {
+        "query": "SELECT column1, column2 FROM schema.table WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM table GROUP BY column",
+        "join": "SELECT * FROM table1 t1 JOIN table2 t2 ON t1.id = t2.id",
+        "masking": "CASE WHEN condition THEN column ELSE CONCAT(LEFT(column, 3), '***') END",
+        "string_functions": "CONCAT, LEFT, RIGHT, SUBSTRING, REPLACE, UPPER, LOWER, TRIM",
+        "date_functions": "DATE_TRUNC, DATEDIFF, DATEADD, GETDATE(), CURRENT_DATE",
+        "warehouse_functions": "LISTAGG, WINDOW functions, APPROXIMATE functions"
+    },
+    "synapse": {
+        "query": "SELECT column1, column2 FROM schema.table WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM table GROUP BY column",
+        "join": "SELECT * FROM table1 t1 JOIN table2 t2 ON t1.id = t2.id",
+        "masking": "CASE WHEN condition THEN column ELSE LEFT(column, 3) + '***' END",
+        "string_functions": "CONCAT, LEFT, RIGHT, SUBSTRING, REPLACE, UPPER, LOWER, TRIM",
+        "date_functions": "GETDATE(), DATEADD, DATEDIFF, YEAR, MONTH, DAY, DATEPART",
+        "warehouse_functions": "STRING_AGG, ARRAY_AGG, WINDOW functions, APPROX_COUNT_DISTINCT"
+    },
+    "databricks": {
+        "query": "SELECT column1, column2 FROM catalog.schema.table WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM table GROUP BY column",
+        "join": "SELECT * FROM table1 t1 JOIN table2 t2 ON t1.id = t2.id",
+        "masking": "CASE WHEN condition THEN column ELSE CONCAT(SUBSTRING(column, 1, 3), '***') END",
+        "string_functions": "CONCAT, SUBSTRING, REPLACE, UPPER, LOWER, TRIM, REGEXP_REPLACE",
+        "date_functions": "DATE_TRUNC, DATEDIFF, DATE_ADD, CURRENT_DATE(), CURRENT_TIMESTAMP()",
+        "warehouse_functions": "ARRAY functions, MAP functions, STRUCT, LATERAL VIEW, EXPLODE"
+    }
+}
+
 NON_SQL_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
     "mongodb": {
         "query": "db.collection.find({filter}, {projection})",
@@ -161,15 +229,17 @@ def get_database_type_name(data_source_type: str) -> str:
     Get the proper database type name from a data source type string.
     
     Args:
-        data_source_type: The data source type (e.g., "postgresql", "mongodb")
+        data_source_type: The data source type (e.g., "postgresql", "mongodb", "snowflake")
     
     Returns:
-        str: The proper database type name (e.g., "PostgreSQL", "MongoDB")
+        str: The proper database type name (e.g., "PostgreSQL", "MongoDB", "Snowflake")
     """
     source_type = data_source_type.lower()
     
     if source_type in SQL_TYPE_MAP:
         return SQL_TYPE_MAP[source_type]
+    elif source_type in CLOUD_WAREHOUSE_TYPE_MAP:
+        return CLOUD_WAREHOUSE_TYPE_MAP[source_type]
     elif source_type in NON_SQL_TYPE_MAP:
         return NON_SQL_TYPE_MAP[source_type]
     else:
@@ -179,16 +249,17 @@ def get_database_type_name(data_source_type: str) -> str:
 def get_source_category(data_source_type: str) -> str:
     """
     Determine source category (sql or non_sql) from data source type.
+    Cloud warehouses are treated as SQL databases.
     
     Args:
-        data_source_type: The data source type (e.g., "postgresql", "mongodb")
+        data_source_type: The data source type (e.g., "postgresql", "mongodb", "snowflake")
     
     Returns:
         str: Either "sql" or "non_sql"
     """
     source_type = data_source_type.lower()
     
-    if source_type in SQL_TYPES:
+    if source_type in SQL_TYPES or source_type in CLOUD_WAREHOUSE_TYPES:
         return "sql"
     elif source_type in NOSQL_TYPES:
         return "non_sql"
@@ -201,15 +272,17 @@ def get_database_dialect(data_source_type: str) -> str:
     Get the database dialect from a data source type.
     
     Args:
-        data_source_type: The data source type (e.g., "postgresql", "mongodb")
+        data_source_type: The data source type (e.g., "postgresql", "mongodb", "snowflake")
     
     Returns:
-        str: The database dialect (e.g., "postgresql", "mongodb", "cql")
+        str: The database dialect (e.g., "postgresql", "mongodb", "snowflake", "cql")
     """
     source_type = data_source_type.lower()
     
     if source_type in SQL_DIALECT_MAP:
         return SQL_DIALECT_MAP[source_type]
+    elif source_type in CLOUD_WAREHOUSE_DIALECT_MAP:
+        return CLOUD_WAREHOUSE_DIALECT_MAP[source_type]
     elif source_type in NON_SQL_DIALECT_MAP:
         return NON_SQL_DIALECT_MAP[source_type]
     else:
@@ -230,9 +303,11 @@ def get_database_query_guidance(data_source_type: str, source_category: str) -> 
     source_type = data_source_type.lower()
     database_name = get_database_type_name(source_type)
     
-    if source_category == "sql" and source_type in SQL_QUERY_PATTERNS:
-        patterns = SQL_QUERY_PATTERNS[source_type]
-        return f"""
+    if source_category == "sql":
+        # Check SQL databases first
+        if source_type in SQL_QUERY_PATTERNS:
+            patterns = SQL_QUERY_PATTERNS[source_type]
+            return f"""
 {database_name} SQL Query Syntax Examples:
 
 1. Basic Query:
@@ -256,6 +331,41 @@ Key {database_name} Features:
 - Use CASE statements or {database_name}-specific functions for column masking
 - Follow {database_name} naming conventions (schema.table, quoted identifiers if needed)
 - Consider {database_name}-specific optimizations (indexes, query hints if applicable)
+"""
+        # Check cloud warehouses
+        elif source_type in CLOUD_WAREHOUSE_QUERY_PATTERNS:
+            patterns = CLOUD_WAREHOUSE_QUERY_PATTERNS[source_type]
+            warehouse_specific = patterns.get('warehouse_functions', '')
+            
+            # Build warehouse-specific section
+            warehouse_section = ''
+            if warehouse_specific:
+                warehouse_section = f"7. Warehouse-Specific Functions: {warehouse_specific}\n\n"
+            
+            return f"""
+{database_name} SQL Query Syntax Examples:
+
+1. Basic Query:
+   {patterns['query']}
+
+2. Aggregation:
+   {patterns['aggregate']}
+
+3. Joins:
+   {patterns['join']}
+
+4. Column Masking:
+   {patterns['masking']}
+
+5. String Functions: {patterns['string_functions']}
+6. Date Functions: {patterns['date_functions']}
+{warehouse_section}Key {database_name} Features:
+- Use proper {database_name} SQL syntax and functions
+- Apply WHERE clauses for row-level security filters
+- Use CASE statements or {database_name}-specific functions for column masking
+- Follow {database_name} naming conventions (database.schema.table, quoted identifiers if needed)
+- Leverage {database_name} warehouse features for analytics and performance
+- Consider {database_name}-specific optimizations (clustering, partitioning, materialized views)
 """
     elif source_category == "non_sql" and source_type in NON_SQL_QUERY_PATTERNS:
         patterns = NON_SQL_QUERY_PATTERNS[source_type]
@@ -314,16 +424,17 @@ Key {database_name} Features:
 def get_database_language(data_source_type: str) -> str:
     """
     Get the query language name for a data source type.
+    Cloud warehouses use SQL.
     
     Args:
-        data_source_type: The data source type (e.g., "postgresql", "mongodb")
+        data_source_type: The data source type (e.g., "postgresql", "mongodb", "snowflake")
     
     Returns:
         str: The query language ("sql" or "nosql")
     """
     source_type = data_source_type.lower()
     
-    if source_type in SQL_TYPES:
+    if source_type in SQL_TYPES or source_type in CLOUD_WAREHOUSE_TYPES:
         return "sql"
     elif source_type in NOSQL_TYPES:
         return "nosql"

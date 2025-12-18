@@ -2,14 +2,9 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
-from api_models import RequestModel, ResponseModel
-from service.service import AIService
-from agent.intent_agent import classify_intent
-from agent.governance_agent import apply_governance
-from agent.planning_agent import create_execution_plan
-from agent.visualization_agent import create_visualizations
-from agent.analyze_ai_agent import analyze_execution_plan
-from database_config import get_database_dialect, get_database_language
+from schemas import RequestModel, ResponseModel
+from services import AIService, process_unified
+from core.database import get_database_dialect, get_database_language
 from dotenv import load_dotenv
 import time
 import uuid
@@ -39,13 +34,16 @@ def normalize_execution_plan(execution_plan: Dict, request_data: Dict) -> Dict:
         query_payload = operation.get('query_payload', {})
         query = operation.get('query', '')
         
-        # Add language, dialect, and statement if not present
+        # Ensure required fields are present
         if 'language' not in query_payload:
             query_payload['language'] = language
         if 'dialect' not in query_payload:
             query_payload['dialect'] = dialect
         if 'statement' not in query_payload:
             query_payload['statement'] = query
+        # Ensure parameters array exists (required in schema)
+        if 'parameters' not in query_payload:
+            query_payload['parameters'] = []
     
     return execution_plan
 
@@ -189,11 +187,14 @@ def validate_request(request_data: Dict[str, Any]) -> None:
                     if not column.get('column_name') or not column.get('column_name', '').strip():
                         raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}].tables[{table_idx}].columns[{col_idx}].column_name is required and cannot be empty")
     
-    # Validate model
-    model = request_data.get('ai_model', 'gemini-2.5-flash-lite')
-    allowed_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
-    if model not in allowed_models:
-        raise ValueError(f"Invalid ai_model: '{model}'. Must be one of {allowed_models}")
+    # Validate model (using Groq model names - more flexible validation)
+    model = request_data.get('ai_model', 'rgen_alpha_v2')
+    # Allow legacy model names and Groq model names
+    legacy_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    allowed_prefixes = ["openai/", "llama-", "mixtral-"]
+    if model not in legacy_models and not any(model.startswith(prefix) for prefix in allowed_prefixes):
+        # More lenient - just warn but allow (for flexibility with future Groq models)
+        pass
     
     # Validate temperature
     temperature = request_data.get('temperature', 0.1)
@@ -212,11 +213,11 @@ def validate_request(request_data: Dict[str, Any]) -> None:
 
 def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
     """
-    Process the request through all agents and return the response.
+    Process the request through unified agent in a single LLM API call.
     
     Args:
         request_data: The request dictionary
-        api_key: API key for the AI service
+        api_key: API key for the AI service (Groq)
     
     Returns:
         Dictionary containing the complete response
@@ -229,17 +230,21 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
     validate_request(request_data)
     
     start_time = time.time()
-    total_tokens = 0
     
     # Validate API key
     if not api_key or api_key.strip() == "":
         raise ValueError("API key is required")
     
-    # Get and validate model
-    model = request_data.get('ai_model', 'gemini-2.5-flash-lite')
-    allowed_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
-    if model not in allowed_models:
-        raise ValueError(f"Unsupported model: {model}. Must be one of {allowed_models}")
+    # Get and map model to Groq format
+    model = request_data.get('ai_model', 'rgen_alpha_v2')
+    # Map model names to Groq models
+    model_mapping = {
+        "rgen_alpha_v2": "openai/gpt-oss-20b",  # Map rgen_alpha_v2 to Groq model
+        "gemini-2.5-flash-lite": "openai/gpt-oss-20b",
+        "gemini-2.5-flash": "openai/gpt-oss-20b"
+    }
+    if model in model_mapping:
+        model = model_mapping[model]
     
     # Initialize AI Service
     try:
@@ -250,17 +255,33 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
     # Generate plan_id
     plan_id = f"plan-{uuid.uuid4().hex[:8]}"
     
-    # Step 1: Classify Intent
+    # Single unified call to process everything
     try:
-        # Validate data source exists before intent classification
+        # Validate data source exists
         if not request_data.get('data_sources') or len(request_data.get('data_sources', [])) == 0:
-            raise ValueError("No data sources provided for intent classification")
+            raise ValueError("No data sources provided")
         
-        intent_result, tokens = classify_intent(service, request_data)
+        # Get visualization flag
+        include_visualization = request_data.get('include_visualization', False)
         
-        # Validate intent result
+        # Make single unified API call
+        unified_result, token_info = process_unified(
+            service,
+            request_data,
+            data_source_index=0,
+            include_visualization=include_visualization
+        )
+        
+        # Extract results from unified output
+        intent_result = unified_result.get('intent', {})
+        governance_result = unified_result.get('governance', {})
+        execution_plan = unified_result.get('execution_plan', {})
+        visualization_output = unified_result.get('visualization')
+        analyze_result = unified_result.get('analysis', {})
+        
+        # Validate unified result
         if not intent_result:
-            raise ValueError("Intent classification returned empty result")
+            raise ValueError("Unified processing returned empty intent result")
         
         if not intent_result.get('intent_type'):
             raise ValueError("Intent classification failed: intent_type is missing")
@@ -268,99 +289,24 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
         if not intent_result.get('source_category'):
             raise ValueError("Intent classification failed: source_category is missing")
         
-        total_tokens += tokens
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "status": "error",
-                "message": "Intent classification validation failed",
-                "detail": str(e)
-            }
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"Intent classification error: {error_type}: {error_msg}")
-        print(traceback.format_exc())
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": "Intent classification failed",
-                "error": error_msg,
-                "type": error_type
-            }
-        )
-    
-    # Step 2: Apply Governance
-    try:
-        # Validate intent result before governance
-        if not intent_result:
-            raise ValueError("Intent result is required for governance application")
-        
-        governance_result, tokens = apply_governance(service, request_data, intent_result)
-        
-        # Validate governance result
         if not governance_result:
-            raise ValueError("Governance application returned empty result")
+            raise ValueError("Unified processing returned empty governance result")
         
-        total_tokens += tokens
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "status": "error",
-                "message": "Governance application validation failed",
-                "detail": str(e)
-            }
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"Governance application error: {error_type}: {error_msg}")
-        print(traceback.format_exc())
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": "Governance application failed",
-                "error": error_msg,
-                "type": error_type
-            }
-        )
-    
-    # Step 3: Create Execution Plan
-    try:
-        # Validate inputs before planning
-        if not intent_result:
-            raise ValueError("Intent result is required for execution planning")
-        
-        if not governance_result:
-            raise ValueError("Governance result is required for execution planning")
-        
-        execution_plan, tokens = create_execution_plan(service, request_data, intent_result, governance_result)
-        
-        # Validate execution plan
         if not execution_plan:
-            raise ValueError("Execution planning returned empty result")
+            raise ValueError("Unified processing returned empty execution plan")
         
         if not execution_plan.get('operations') or len(execution_plan.get('operations', [])) == 0:
             raise ValueError("Execution plan must contain at least one operation")
         
-        total_tokens += tokens
+        if not analyze_result:
+            raise ValueError("Unified processing returned empty analysis result")
+        
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "status": "error",
-                "message": "Execution planning validation failed",
+                "message": "Unified processing validation failed",
                 "detail": str(e)
             }
         )
@@ -370,13 +316,13 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e)
-        print(f"Execution planning error: {error_type}: {error_msg}")
+        print(f"Unified processing error: {error_type}: {error_msg}")
         print(traceback.format_exc())
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "status": "error",
-                "message": "Execution planning failed",
+                "message": "Unified processing failed",
                 "error": error_msg,
                 "type": error_type
             }
@@ -398,90 +344,72 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
                 raise ValueError(f"Operation {operation.get('step_id', 'unknown')} is missing governance_applied")
             
             gov_applied = operation.get('governance_applied', {})
-            # Add rls_rules and masking_rules if not present
-            if 'rls_rules' not in gov_applied and 'row_filters' in gov_applied:
-                gov_applied['rls_rules'] = [f"rule_{i+1}" for i in range(len(gov_applied.get('row_filters', [])))]
-            if 'masking_rules' not in gov_applied and 'column_masking' in gov_applied:
-                gov_applied['masking_rules'] = [f"mask_{i+1}" for i in range(len(gov_applied.get('column_masking', [])))]
+            # Ensure rls_rules and masking_rules are present (required fields)
+            # If they come from LLM as row_filters/column_masking, convert them
+            if 'rls_rules' not in gov_applied or not gov_applied.get('rls_rules'):
+                if 'row_filters' in gov_applied:
+                    # Convert row_filters to rls_rules (use filter descriptions or generate names)
+                    row_filters = gov_applied.get('row_filters', [])
+                    gov_applied['rls_rules'] = [
+                        f"rls_rule_{i+1}" if isinstance(f, str) else str(f)
+                        for i, f in enumerate(row_filters)
+                    ] if row_filters else []
+                else:
+                    gov_applied['rls_rules'] = []
+            
+            if 'masking_rules' not in gov_applied or not gov_applied.get('masking_rules'):
+                if 'column_masking' in gov_applied:
+                    # Convert column_masking list to masking_rules strings
+                    column_masking = gov_applied.get('column_masking', [])
+                    if isinstance(column_masking, list) and len(column_masking) > 0:
+                        # Extract masking rule names/descriptions
+                        masking_rules = []
+                        for mask in column_masking:
+                            if isinstance(mask, dict):
+                                column = mask.get('column', 'unknown')
+                                func = mask.get('masking_function', 'mask')
+                                masking_rules.append(f"{column}_{func}")
+                            else:
+                                masking_rules.append(str(mask))
+                        gov_applied['masking_rules'] = masking_rules
+                    else:
+                        gov_applied['masking_rules'] = []
+                else:
+                    gov_applied['masking_rules'] = []
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to normalize governance rules: {str(e)}"
         )
     
-    # Step 4: Create Visualizations (if requested)
-    visualizations = []
-    if request_data.get('include_visualization', False):
-        try:
-            visualizations, tokens = create_visualizations(service, request_data, intent_result, execution_plan)
-            total_tokens += tokens
-        except HTTPException:
-            # Re-raise HTTP exceptions
-            raise
-        except Exception as e:
-            # Visualization is optional, log but don't fail the entire request
-            error_type = type(e).__name__
-            error_msg = str(e)
-            print(f"Warning: Visualization generation failed: {error_type}: {error_msg}")
-            print(traceback.format_exc())
-            visualizations = []
-    
-    # Step 5: Analyze Execution Plan
-    generation_time_ms = int((time.time() - start_time) * 1000)
-    
-    try:
-        # Validate inputs before analysis
-        if not execution_plan:
-            raise ValueError("Execution plan is required for AI analysis")
-        
-        analyze_result, tokens = analyze_execution_plan(
-            service, request_data, intent_result, governance_result, execution_plan,
-            tokens_used=total_tokens,
-            generation_time_ms=generation_time_ms
-        )
-        
-        # Validate analysis result
-        if not analyze_result:
-            raise ValueError("AI analysis returned empty result")
-        
-        if not analyze_result.get('ai_metadata'):
-            raise ValueError("AI analysis result is missing ai_metadata")
-        
-        total_tokens += tokens
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "status": "error",
-                "message": "AI analysis validation failed",
-                "detail": str(e)
-            }
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"AI analysis error: {error_type}: {error_msg}")
-        print(traceback.format_exc())
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": "AI analysis failed",
-                "error": error_msg,
-                "type": error_type
-            }
-        )
-    
     # Final generation time
     final_generation_time_ms = int((time.time() - start_time) * 1000)
     
-    # Update ai_metadata with final token count and time
-    ai_metadata = analyze_result.get('ai_metadata', {})
-    ai_metadata['tokens_used'] = total_tokens
-    ai_metadata['generation_time_ms'] = final_generation_time_ms
+    # Extract token information
+    prompt_tokens = token_info.get('prompt_tokens', 0) if isinstance(token_info, dict) else 0
+    completion_tokens = token_info.get('completion_tokens', 0) if isinstance(token_info, dict) else 0
+    total_tokens = token_info.get('total_tokens', 0) if isinstance(token_info, dict) else (token_info if isinstance(token_info, int) else 0)
+    
+    # Map to input_tokens_used and output_tokens_used (primary fields)
+    input_tokens_used = prompt_tokens if prompt_tokens > 0 else total_tokens
+    output_tokens_used = completion_tokens if completion_tokens > 0 else 0
+    
+    # Build AI metadata from analysis result
+    ai_metadata = {
+        "model": model,
+        "confidence": analyze_result.get('confidence_score', 0.0) / 100.0 if analyze_result.get('confidence_score', 0) > 1 else analyze_result.get('confidence_score', 0.0),
+        "confidence_score": analyze_result.get('confidence_score', 0.0) / 100.0 if analyze_result.get('confidence_score', 0) > 1 else analyze_result.get('confidence_score', 0.0),
+        "input_tokens_used": input_tokens_used,
+        "output_tokens_used": output_tokens_used,
+        "generation_time_ms": final_generation_time_ms,
+        "explanation": analyze_result.get('explanation', ''),
+        "reasoning_steps": analyze_result.get('reasoning_steps', []),
+        # Backward compatibility fields
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "tokens_used": total_tokens
+    }
     
     # Build final response with validation
     try:
@@ -491,10 +419,6 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
         
         if not intent_result.get('intent_summary'):
             raise ValueError("intent_summary is missing from intent result")
-        
-        if not ai_metadata.get('confidence') is None:
-            if not isinstance(ai_metadata.get('confidence'), (int, float)):
-                raise ValueError("ai_metadata.confidence must be a number")
         
         final_output = {
             "request_id": request_data.get('request_id', ''),
@@ -509,9 +433,11 @@ def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any
             "suggestions": analyze_result.get('suggestions', [])
         }
         
-        # Only include visualization if requested
-        if request_data.get('include_visualization', False) and visualizations:
-            final_output["visualization"] = visualizations
+        # Only include visualization if requested and available
+        if include_visualization and visualization_output:
+            visualizations = visualization_output.get('visualizations', [])
+            if visualizations:
+                final_output["visualization"] = visualizations
         
         return final_output
     except ValueError as e:
@@ -531,16 +457,19 @@ async def analyze(request: RequestModel):
     """
     Main endpoint for intent classification, governance, planning, visualization, and analysis.
     
-    This endpoint processes a user request through multiple AI agents:
+    This endpoint processes a user request through a unified AI agent in a single LLM API call:
     1. Intent Classification - Determines the user's intent
     2. Governance Application - Applies security and masking rules
     3. Execution Planning - Creates executable database commands
     4. Visualization Generation - Recommends visualizations (if requested)
     5. AI Analysis - Provides confidence scores and suggestions
     
+    All results are generated from a single Groq API call for efficiency.
+    
     **Model Validation:**
-    - `ai_model` must be either "gemini-2.5-flash-lite" or "gemini-2.5-flash"
-    - Default is "gemini-2.5-flash-lite"
+    - `ai_model` default is "rgen_alpha_v2" (mapped to Groq "openai/gpt-oss-20b")
+    - Also supports Groq models like "openai/gpt-oss-20b"
+    - Legacy model names "gemini-2.5-flash-lite" and "gemini-2.5-flash" are automatically mapped to "openai/gpt-oss-20b"
     
     **Request Validation:**
     - All required fields are validated
@@ -551,13 +480,13 @@ async def analyze(request: RequestModel):
     Returns a complete response with execution plan, visualizations, and analysis.
     """
     try:
-        # Get API key from environment variable
-        api_key = os.getenv("GEMINI_API_KEY")
+        # Get API key from environment variable (Groq API key)
+        api_key = os.getenv("GROQ_API_KEY")
         
         if not api_key or api_key.strip() == "":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="API key is required. Please set GEMINI_API_KEY in your .env file or environment variables."
+                detail="API key is required. Please set GROQ_API_KEY in your .env file or environment variables."
             )
         
         # Convert Pydantic model to dict (Pydantic already validated the structure)
