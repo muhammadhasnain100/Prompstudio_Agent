@@ -1,303 +1,193 @@
+"""AI Service for LLM interactions with retry logic and async support."""
+
+import os
+import time
+import asyncio
+import logging
+from typing import Dict, Any, Optional, Type
+from concurrent.futures import ThreadPoolExecutor
 from groq import Groq
 from pydantic import BaseModel
-import json
-import time
-from typing import Optional, Tuple, Any, Dict
+from utils import retry_on_failure
+
+logger = logging.getLogger(__name__)
+
+# Thread pool executor for running sync Groq calls in async context
+_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ai_service")
 
 
-def _clean_response(data: Any) -> Any:
-    """
-    Clean up response data to handle common LLM formatting issues.
-    
-    Args:
-        data: The parsed JSON response
-    
-    Returns:
-        Cleaned data structure
-    """
-    if isinstance(data, dict):
-        cleaned = {}
-        for key, value in data.items():
-            # Handle governance field specifically
-            if key == 'governance' and isinstance(value, dict):
-                governance_cleaned = {}
-                # Ensure required fields have defaults
-                governance_cleaned['row_filters'] = value.get('row_filters', [])
-                governance_cleaned['column_masking_rules'] = value.get('column_masking_rules', [])
-                governance_cleaned['governance_applied'] = value.get('governance_applied', [])
-                governance_cleaned['governance_impact'] = value.get('governance_impact', '')
-                governance_cleaned['planning_notes'] = value.get('planning_notes', [])
-                # Clean nested structures
-                for gkey, gvalue in governance_cleaned.items():
-                    if isinstance(gvalue, (dict, list)):
-                        governance_cleaned[gkey] = _clean_response(gvalue)
-                cleaned[key] = governance_cleaned
-            # Handle analysis field specifically
-            elif key == 'analysis' and isinstance(value, dict):
-                analysis_cleaned = {}
-                for akey, avalue in value.items():
-                    if akey == 'reasoning_steps' and isinstance(avalue, list):
-                        flattened = []
-                        for item in avalue:
-                            if isinstance(item, str):
-                                flattened.append(item)
-                            elif isinstance(item, list):
-                                # Flatten nested lists
-                                flattened.extend([str(i) for i in item if i])
-                            else:
-                                flattened.append(str(item))
-                        analysis_cleaned[akey] = flattened
-                    elif akey == 'suggestions':
-                        if not avalue or (isinstance(avalue, list) and len(avalue) == 0):
-                            analysis_cleaned[akey] = []
-                        else:
-                            analysis_cleaned[akey] = avalue
-                    else:
-                        analysis_cleaned[akey] = _clean_response(avalue)
-                cleaned[key] = analysis_cleaned
-            # Handle reasoning_steps that might be nested lists (at top level or in other places)
-            elif key == 'reasoning_steps' and isinstance(value, list):
-                flattened = []
-                for item in value:
-                    if isinstance(item, str):
-                        flattened.append(item)
-                    elif isinstance(item, list):
-                        # Flatten nested lists
-                        flattened.extend([str(i) for i in item if i])
-                    else:
-                        flattened.append(str(item))
-                cleaned[key] = flattened
-            # Handle suggestions that might be missing
-            elif key == 'suggestions' and (not value or (isinstance(value, list) and len(value) == 0)):
-                cleaned[key] = []
-            # Handle query field in operations
-            elif key == 'operations' and isinstance(value, list):
-                cleaned_ops = []
-                for op in value:
-                    if isinstance(op, dict):
-                        # If query is missing, try to get it from query_payload.statement
-                        if 'query' not in op or not op.get('query'):
-                            if 'query_payload' in op and isinstance(op['query_payload'], dict):
-                                if 'statement' in op['query_payload']:
-                                    op['query'] = op['query_payload']['statement']
-                                else:
-                                    op['query'] = ""
-                        # Recursively clean nested structures
-                        op = _clean_response(op)
-                    cleaned_ops.append(op)
-                cleaned[key] = cleaned_ops
-            else:
-                cleaned[key] = _clean_response(value)
-        return cleaned
-    elif isinstance(data, list):
-        return [_clean_response(item) for item in data]
-    else:
-        return data
+class AIServiceError(Exception):
+    """Custom exception for AI service errors."""
+    pass
 
 
 class AIService:
-    """
-    Service class for AI model interactions using Groq.
-    Handles communication with the AI model for generating responses.
-    """
+    """Service for interacting with Groq LLM API with retry logic and error handling."""
     
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b"):
+    def __init__(self, api_key: str, model: str = "meta-llama/llama-4-scout-17b-16e-instruct"):
         """
-        Initialize the AI Service.
+        Initialize the AI service.
         
         Args:
-            api_key: API key for the Groq API
-            model: Model name to use (default: "openai/gpt-oss-20b")
+            api_key: Groq API key
+            model: Model name to use
         """
-        self.api_key = api_key
-        self.model = model
+        if not api_key:
+            raise AIServiceError("API key is required")
+        
         self.client = Groq(api_key=api_key)
+        self.model = model
+        logger.info(f"AI Service initialized with model: {model}")
     
-    def generate_response(
-        self, 
-        system_instruction: str, 
-        prompt: str, 
-        output_schema: BaseModel,
-        print_tokens: bool = True,
-        max_retries: int = 3,
-        retry_delay: float = 1.0
-    ) -> Tuple[dict, Dict[str, int]]:
+    def _generate_response_sync(
+        self,
+        system_instruction: str,
+        prompt: str,
+        output_schema: Type[BaseModel],
+        max_completion_tokens: int = 4096,
+        timeout: int = 120
+    ) -> tuple[Dict[str, Any], Dict[str, int]]:
         """
-        Generate a response from the AI model with retry logic.
+        Generate a response from the LLM with retry logic.
         
         Args:
-            system_instruction: System instruction for the AI model
-            prompt: User prompt/query
-            output_schema: Pydantic model defining the expected output schema
-            print_tokens: Whether to print token usage (default: True)
-            max_retries: Maximum number of retry attempts (default: 3, total attempts = 3)
-            retry_delay: Initial delay between retries in seconds (default: 1.0)
+            system_instruction: System prompt/instruction
+            prompt: User prompt
+            output_schema: Pydantic model for output validation
+            max_completion_tokens: Maximum tokens for completion
+            timeout: Request timeout in seconds
         
         Returns:
-            Tuple of (response_dict, token_info_dict) where token_info contains:
-                - prompt_tokens: Number of tokens in the prompt
-                - completion_tokens: Number of tokens in the completion
-                - total_tokens: Total tokens used
+            Tuple of (response_dict, token_info)
         
         Raises:
-            Exception: If all retry attempts fail
+            AIServiceError: If generation fails after retries
         """
-        last_exception = None
+        start_time = time.time()
         
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": output_schema.__class__.__name__.lower(),
-                            "schema": output_schema.model_json_schema()
-                        }
+        try:
+            # Get JSON schema from Pydantic model
+            schema = output_schema.model_json_schema()
+            # Remove any strict validation that might cause issues
+            schema.pop('additionalProperties', None)
+            
+            logger.debug(f"Calling LLM API with model: {self.model}")
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": output_schema.__class__.__name__.lower(),
+                        "schema": schema,
+                        "strict": False
                     }
-                )
-                
-                # Parse the response
-                response_content = response.choices[0].message.content
-                
-                # Extract token information from Groq response
-                if hasattr(response, 'usage') and response.usage:
-                    prompt_tokens = response.usage.prompt_tokens if hasattr(response.usage, 'prompt_tokens') else 0
-                    completion_tokens = response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else 0
-                    total_tokens = response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
-                else:
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    total_tokens = 0
-                
-                if print_tokens:
-                    print(f"Prompt tokens: {prompt_tokens}")
-                    print(f"Completion tokens: {completion_tokens}")
-                    print(f"Total tokens: {total_tokens}")
-                
-                # Parse JSON response
-                parsed_response = json.loads(response_content)
-                
-                # Clean up the response to handle common LLM formatting issues
-                parsed_response = _clean_response(parsed_response)
-                
-                # Validate with Pydantic model
-                validated_response = output_schema.model_validate(parsed_response)
-                
-                # Return response dict and token information
-                token_info = {
-                    'prompt_tokens': prompt_tokens,
-                    'completion_tokens': completion_tokens,
-                    'total_tokens': total_tokens
-                }
-                
-                return validated_response.model_dump(), token_info
-                
+                },
+                max_completion_tokens=max_completion_tokens,
+                timeout=timeout,
+            )
+            
+            generation_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Parse the response
+            response_content = response.choices[0].message.content
+            
+            # Extract token information
+            if hasattr(response, 'usage') and response.usage:
+                prompt_tokens = response.usage.prompt_tokens if hasattr(response.usage, 'prompt_tokens') else 0
+                completion_tokens = response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else 0
+            else:
+                prompt_tokens = 0
+                completion_tokens = 0
+            
+            token_info = {
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens,
+                'generation_time_ms': generation_time_ms
+            }
+            
+            # Validate and parse JSON response
+            import json
+            try:
+                response_dict = json.loads(response_content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {str(e)}")
+                raise AIServiceError(f"Invalid JSON response from LLM: {str(e)}")
+            
+            # Validate response against schema - fail if validation fails
+            try:
+                validated_response = output_schema.model_validate(response_dict)
+                response_dict = validated_response.model_dump()
             except Exception as e:
-                last_exception = e
-                error_type = type(e).__name__
-                error_msg = str(e)
-                
-                # Check if this is a retryable error
-                is_retryable = self._is_retryable_error(e)
-                
-                if not is_retryable or attempt >= max_retries:
-                    # Don't retry non-retryable errors or if we've exhausted retries
-                    if attempt >= max_retries:
-                        print(f"Groq API call failed after {max_retries} attempts. Last error: {error_type}: {error_msg}")
-                    raise
-                
-                # Calculate exponential backoff delay
-                delay = retry_delay * (2 ** (attempt - 1))
-                print(f"Groq API call failed (attempt {attempt}/{max_retries}): {error_type}: {error_msg}")
-                print(f"Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
-        
-        # This should never be reached, but just in case
-        if last_exception:
-            raise last_exception
-        raise Exception("Failed to generate response after retries")
+                logger.error(
+                    f"Schema validation failed: {str(e)} - "
+                    f"Response keys: {list(response_dict.keys()) if response_dict else 'None'}"
+                )
+                raise AIServiceError(f"Schema validation failed: {str(e)}")
+            
+            logger.info(
+                f"LLM response generated successfully in {generation_time_ms}ms. "
+                f"Tokens: {prompt_tokens} prompt + {completion_tokens} completion"
+            )
+            
+            return response_dict, token_info
+            
+        except Exception as e:
+            generation_time_ms = int((time.time() - start_time) * 1000)
+            logger.error(
+                f"Failed to generate LLM response after {generation_time_ms}ms: {str(e)}",
+                exc_info=True
+            )
+            raise AIServiceError(f"LLM API call failed: {str(e)}") from e
     
-    def _is_retryable_error(self, error: Exception) -> bool:
+    @retry_on_failure(
+        max_retries=3,
+        delay=1.0,
+        backoff_factor=2.0,
+        exceptions=(Exception,),
+        logger_instance=logger
+    )
+    async def generate_response(
+        self,
+        system_instruction: str,
+        prompt: str,
+        output_schema: Type[BaseModel],
+        max_completion_tokens: int = 4096,
+        timeout: int = 120
+    ) -> tuple[Dict[str, Any], Dict[str, int]]:
         """
-        Determine if an error is retryable.
+        Generate a response from the LLM with retry logic (async).
         
         Args:
-            error: The exception that occurred
+            system_instruction: System prompt/instruction
+            prompt: User prompt
+            output_schema: Pydantic model for output validation
+            max_completion_tokens: Maximum tokens for completion
+            timeout: Request timeout in seconds
         
         Returns:
-            bool: True if the error is retryable, False otherwise
+            Tuple of (response_dict, token_info)
+        
+        Raises:
+            AIServiceError: If generation fails after retries
         """
-        error_type = type(error).__name__
-        error_msg = str(error).lower()
-        
-        # Retryable errors (network issues, rate limits, temporary failures)
-        retryable_errors = [
-            "rate limite",
-            "quota",
-            "429",
-            "503",
-            "502",
-            "500",
-            "timeout",
-            "connection",
-            "network",
-            "temporary",
-            "unavailable",
-            "service unavailable",
-            "internal error",
-            "deadline exceeded",
-            "resource exhausted"
-        ]
-        
-        # Non-retryable errors (authentication, invalid request, etc.)
-        non_retryable_errors = [
-            "401",
-            "403",
-            "400",
-            "invalid",
-            "authentication",
-            "authorization",
-            "forbidden",
-            "unauthorized",
-            "bad request",
-            "not found",
-            "404"
-        ]
-        
-        # Check for non-retryable errors first
-        for non_retryable in non_retryable_errors:
-            if non_retryable in error_msg:
-                return False
-        
-        # Check for retryable errors
-        for retryable in retryable_errors:
-            if retryable in error_msg:
-                return True
-        
-        # Default: retry unknown errors (they might be temporary)
-        return True
-    
-    def set_model(self, model: str):
-        """
-        Update the model to use.
-        
-        Args:
-            model: New model name
-        """
-        self.model = model
-    
-    def set_api_key(self, api_key: str):
-        """
-        Update the API key.
-        
-        Args:
-            api_key: New API key
-        """
-        self.api_key = api_key
-        self.client = Groq(api_key=api_key)
-
+        loop = asyncio.get_event_loop()
+        try:
+            # Run sync Groq call in thread pool to avoid blocking
+            result = await loop.run_in_executor(
+                _executor,
+                self._generate_response_sync,
+                system_instruction,
+                prompt,
+                output_schema,
+                max_completion_tokens,
+                timeout
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Async LLM generation failed: {str(e)}", exc_info=True)
+            raise AIServiceError(f"Async LLM API call failed: {str(e)}") from e

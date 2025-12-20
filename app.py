@@ -1,538 +1,481 @@
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from pydantic import ValidationError
-from schemas import RequestModel, ResponseModel
-from services import AIService, process_unified
-from core.database import get_database_dialect, get_database_language
-from dotenv import load_dotenv
-import time
-import uuid
+"""FastAPI application for the analyze endpoint."""
+
 import os
-import traceback
+import uuid
+import time
+import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import List, Dict, Optional, Any
+from fastapi import FastAPI, HTTPException, status, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator, model_validator
+from dotenv import load_dotenv
 
-# Load environment variables from .env file
+from schema.agent import ExecutionResponse, ExecutionResponseLLM
+from schema.prompts import getdatabase, get_system_prompt, prepare_prompt
+from services.ai import AIService, AIServiceError
+from middleware import RateLimitMiddleware, SecurityHeadersMiddleware
+from utils import (
+    retry_on_failure, generate_cache_key, get_cached_response, 
+    cache_response, setup_logging
+)
+
+# Setup logging
+setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
-
-
-def normalize_execution_plan(execution_plan: Dict, request_data: Dict) -> Dict:
-    """
-    Normalize execution plan to match the expected response format.
-    Adds language, dialect, and statement fields to query_payload.
-    """
-    data_source = request_data.get('data_sources', [{}])[0]
-    datasource_type = data_source.get('type', 'postgresql')
-    
-    # Use database_config functions for consistency
-    dialect = get_database_dialect(datasource_type)
-    language = get_database_language(datasource_type)
-    
-    # Update each operation's query_payload
-    for operation in execution_plan.get('operations', []):
-        query_payload = operation.get('query_payload', {})
-        query = operation.get('query', '')
-        
-        # Ensure required fields are present
-        if 'language' not in query_payload:
-            query_payload['language'] = language
-        if 'dialect' not in query_payload:
-            query_payload['dialect'] = dialect
-        if 'statement' not in query_payload:
-            query_payload['statement'] = query
-        # Ensure parameters array exists (required in schema)
-        if 'parameters' not in query_payload:
-            query_payload['parameters'] = []
-    
-    return execution_plan
-
 
 app = FastAPI(
     title="RiverGen PSA API",
-    description="API for intent classification, governance, planning, visualization, and analysis",
-    version="1.0.0"
+    description="API for intelligent SQL planning, governance enforcement, and execution plan generation",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
+# CORS configuration - Allow localhost by default
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+    max_age=3600,
+)
 
-# Exception handlers
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle request validation errors."""
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "status": "error",
-            "message": "Request validation failed",
-            "errors": exc.errors(),
-            "detail": str(exc)
-        }
+# Add security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add rate limiting middleware (60 requests per minute per IP)
+rate_limit_per_minute = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+app.add_middleware(RateLimitMiddleware, requests_per_minute=rate_limit_per_minute)
+
+
+# Request Models
+class UserAttribute(BaseModel):
+    """User attribute key-value pairs."""
+    pass
+
+
+class UserContext(BaseModel):
+    """User context information."""
+    user_id: int
+    workspace_id: int
+    organization_id: int
+    roles: List[str] = Field(default_factory=list)
+    permissions: List[str] = Field(default_factory=list)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class Column(BaseModel):
+    """Database column definition."""
+    column_name: str
+    column_type: str
+    is_nullable: Optional[bool] = True
+    is_primary_key: Optional[bool] = False
+    is_foreign_key: Optional[bool] = False
+    column_comment: Optional[str] = None
+    pii: Optional[bool] = False
+
+
+class Table(BaseModel):
+    """Database table definition."""
+    table_name: str
+    table_type: Optional[str] = "table"
+    row_count: Optional[int] = 0
+    indexes: Optional[List[str]] = Field(default_factory=list)
+    columns: List[Column] = Field(default_factory=list)
+
+
+class Schema(BaseModel):
+    """Database schema definition."""
+    schema_name: str
+    tables: List[Table] = Field(default_factory=list)
+
+
+class GovernanceRule(BaseModel):
+    """Governance rule definition."""
+    condition: Optional[str] = None
+    description: Optional[str] = None
+    column: Optional[str] = None
+    masking_function: Optional[str] = None
+
+
+class RowLevelSecurity(BaseModel):
+    """Row-level security configuration."""
+    enabled: bool = False
+    rules: List[GovernanceRule] = Field(default_factory=list)
+
+
+class ColumnMasking(BaseModel):
+    """Column masking configuration."""
+    enabled: bool = False
+    rules: List[GovernanceRule] = Field(default_factory=list)
+
+
+class GovernancePolicies(BaseModel):
+    """Governance policies configuration."""
+    row_level_security: Optional[RowLevelSecurity] = None
+    column_masking: Optional[ColumnMasking] = None
+
+
+class DataSource(BaseModel):
+    """Data source definition."""
+    data_source_id: int
+    name: str
+    type: str
+    schemas: List[Schema] = Field(default_factory=list)
+    governance_policies: Optional[GovernancePolicies] = None
+
+
+class ExecutionContext(BaseModel):
+    """Execution context configuration."""
+    max_rows: int = Field(default=1000, ge=1, le=100000)
+    timeout_seconds: int = Field(default=30, ge=1, le=3600)
+
+
+class RequestModel(BaseModel):
+    """Main request model for the API."""
+    request_id: str
+    execution_id: str
+    timestamp: Optional[str] = None
+    user_context: UserContext
+    user_prompt: str = Field(..., min_length=1, description="User's natural language query")
+    data_sources: List[DataSource] = Field(..., min_length=1, description="List of data sources")
+    selected_schema_names: Optional[List[str]] = Field(default_factory=list)
+    execution_context: Optional[ExecutionContext] = None
+    ai_model: Optional[str] = Field(
+        default="meta-llama/llama-4-scout-17b-16e-instruct",
+        description="AI model to use. Must be 'meta-llama/llama-4-scout-17b-16e-instruct'"
     )
+    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=2.0)
+    include_visualization: Optional[bool] = False
 
+    @field_validator('ai_model')
+    @classmethod
+    def validate_ai_model(cls, v):
+        """Validate that ai_model is 'meta-llama/llama-4-scout-17b-16e-instruct'."""
+        if not v:
+            return "meta-llama/llama-4-scout-17b-16e-instruct"
+        
+        # Check if the model is the required scout model
+        if v != "meta-llama/llama-4-scout-17b-16e-instruct":
+            raise ValueError(
+                f"Invalid model '{v}'. Only 'meta-llama/llama-4-scout-17b-16e-instruct' is allowed."
+            )
+        
+        return v
 
-@app.exception_handler(ValidationError)
-async def pydantic_validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors."""
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "status": "error",
-            "message": "Validation error",
-            "errors": exc.errors(),
-            "detail": str(exc)
-        }
-    )
+    @model_validator(mode='after')
+    def validate_data_source_types(self):
+        """Validate that all data source types are from supported categories (SQL, NoSQL, or Cloud Warehouse)."""
+        # These must match exactly the types defined in prompts.py
+        SQL_TYPES = {"postgresql", "mysql", "mariadb", "sqlserver", "oracle"}
+        CLOUD_WAREHOUSE_TYPES = {"snowflake", "bigquery", "redshift", "synapse", "databricks"}
+        NOSQL_TYPES = {"mongodb", "cassandra", "redis", "dynamodb", "elasticsearch"}
+        
+        SUPPORTED_TYPES = SQL_TYPES | CLOUD_WAREHOUSE_TYPES | NOSQL_TYPES
+        
+        invalid_types = []
+        for data_source in self.data_sources:
+            source_type = data_source.type.lower().strip()
+            if source_type not in SUPPORTED_TYPES:
+                invalid_types.append(f"'{data_source.type}' (data_source_id: {data_source.data_source_id})")
+        
+        if invalid_types:
+            raise ValueError(
+                f"Unsupported data source type(s): {', '.join(invalid_types)}. "
+                f"Supported types are: SQL databases ({', '.join(sorted(SQL_TYPES))}), "
+                f"Cloud Warehouses ({', '.join(sorted(CLOUD_WAREHOUSE_TYPES))}), "
+                f"and NoSQL databases ({', '.join(sorted(NOSQL_TYPES))})"
+            )
+        
+        return self
 
 
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
     """Handle ValueError exceptions."""
+    logger.warning(f"Validation error: {str(exc)} - Path: {request.url.path}")
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={
             "status": "error",
-            "message": "Invalid value provided",
-            "detail": str(exc)
+            "message": str(exc),
+            "error_type": "validation_error",
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+@app.exception_handler(status.HTTP_429_TOO_MANY_REQUESTS)
+async def rate_limit_handler(request: Request, exc: HTTPException):
+    """Handle rate limit exceptions."""
+    logger.warning(f"Rate limit exceeded for IP: {request.client.host if request.client else 'unknown'}")
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "status": "error",
+            "message": exc.detail,
+            "error_type": "rate_limit_exceeded",
+            "timestamp": datetime.now().isoformat()
         }
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle all other exceptions."""
+    """Handle general exceptions."""
+    error_id = str(uuid.uuid4())
+    logger.error(
+        f"Unhandled exception: {type(exc).__name__}: {str(exc)} - "
+        f"Path: {request.url.path} - Error ID: {error_id}",
+        exc_info=True
+    )
+    
+    # Don't expose internal error details in production
+    error_message = str(exc) if os.getenv("ENVIRONMENT", "development") == "development" else "An internal error occurred"
+    
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "status": "error",
-            "message": "Internal server error",
-            "detail": str(exc),
-            "type": type(exc).__name__
+            "message": error_message,
+            "error_type": "internal_error",
+            "error_id": error_id,
+            "timestamp": datetime.now().isoformat()
         }
     )
 
 
-def validate_request(request_data: Dict[str, Any]) -> None:
+@app.post("/analyze", response_model=ExecutionResponse)
+async def analyze(request: RequestModel, http_request: Request):
     """
-    Validate all parts of the request and raise appropriate exceptions.
+    Main endpoint for analyzing user requests and generating execution plans.
     
-    Args:
-        request_data: The request dictionary
-    
-    Raises:
-        ValueError: For validation errors with specific error messages
-    """
-    # Validate required fields
-    if not request_data.get('request_id'):
-        raise ValueError("request_id is required and cannot be empty")
-    
-    if not request_data.get('execution_id'):
-        raise ValueError("execution_id is required and cannot be empty")
-    
-    if not request_data.get('user_prompt') or not request_data.get('user_prompt', '').strip():
-        raise ValueError("user_prompt is required and cannot be empty")
-    
-    # Validate user_context
-    user_context = request_data.get('user_context')
-    if not user_context:
-        raise ValueError("user_context is required")
-    
-    if not isinstance(user_context.get('user_id'), int) or user_context.get('user_id') is None:
-        raise ValueError("user_context.user_id is required and must be an integer")
-    
-    if not isinstance(user_context.get('workspace_id'), int) or user_context.get('workspace_id') is None:
-        raise ValueError("user_context.workspace_id is required and must be an integer")
-    
-    if not isinstance(user_context.get('organization_id'), int) or user_context.get('organization_id') is None:
-        raise ValueError("user_context.organization_id is required and must be an integer")
-    
-    # Validate data_sources
-    data_sources = request_data.get('data_sources', [])
-    if not data_sources or len(data_sources) == 0:
-        raise ValueError("At least one data_source is required")
-    
-    for idx, data_source in enumerate(data_sources):
-        if not data_source.get('data_source_id'):
-            raise ValueError(f"data_sources[{idx}].data_source_id is required")
-        
-        if not data_source.get('name') or not data_source.get('name', '').strip():
-            raise ValueError(f"data_sources[{idx}].name is required and cannot be empty")
-        
-        if not data_source.get('type') or not data_source.get('type', '').strip():
-            raise ValueError(f"data_sources[{idx}].type is required and cannot be empty")
-        
-        # Validate schemas
-        schemas = data_source.get('schemas', [])
-        if not schemas or len(schemas) == 0:
-            raise ValueError(f"data_sources[{idx}] must have at least one schema")
-        
-        for schema_idx, schema in enumerate(schemas):
-            if not schema.get('schema_name') or not schema.get('schema_name', '').strip():
-                raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}].schema_name is required and cannot be empty")
-            
-            # Validate tables
-            tables = schema.get('tables', [])
-            if not tables or len(tables) == 0:
-                raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}] must have at least one table")
-            
-            for table_idx, table in enumerate(tables):
-                if not table.get('table_name') or not table.get('table_name', '').strip():
-                    raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}].tables[{table_idx}].table_name is required and cannot be empty")
-                
-                # Validate columns
-                columns = table.get('columns', [])
-                if not columns or len(columns) == 0:
-                    raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}].tables[{table_idx}] must have at least one column")
-                
-                for col_idx, column in enumerate(columns):
-                    if not column.get('column_name') or not column.get('column_name', '').strip():
-                        raise ValueError(f"data_sources[{idx}].schemas[{schema_idx}].tables[{table_idx}].columns[{col_idx}].column_name is required and cannot be empty")
-    
-    # Validate model (using Groq model names - more flexible validation)
-    model = request_data.get('ai_model', 'rgen_alpha_v2')
-    # Allow legacy model names and Groq model names
-    legacy_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
-    allowed_prefixes = ["openai/", "llama-", "mixtral-"]
-    if model not in legacy_models and not any(model.startswith(prefix) for prefix in allowed_prefixes):
-        # More lenient - just warn but allow (for flexibility with future Groq models)
-        pass
-    
-    # Validate temperature
-    temperature = request_data.get('temperature', 0.1)
-    if not isinstance(temperature, (int, float)) or temperature < 0.0 or temperature > 2.0:
-        raise ValueError(f"temperature must be a number between 0.0 and 2.0, got {temperature}")
-    
-    # Validate execution_context if provided
-    exec_context = request_data.get('execution_context')
-    if exec_context:
-        if not isinstance(exec_context.get('max_rows'), int) or exec_context.get('max_rows', 0) <= 0:
-            raise ValueError("execution_context.max_rows must be a positive integer")
-        
-        if not isinstance(exec_context.get('timeout_seconds'), int) or exec_context.get('timeout_seconds', 0) <= 0:
-            raise ValueError("execution_context.timeout_seconds must be a positive integer")
-
-
-def process_request(request_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
-    """
-    Process the request through unified agent in a single LLM API call.
-    
-    Args:
-        request_data: The request dictionary
-        api_key: API key for the AI service (Groq)
-    
-    Returns:
-        Dictionary containing the complete response
-    
-    Raises:
-        ValueError: If validation fails or model is not supported
-        HTTPException: For processing errors
-    """
-    # Validate entire request first
-    validate_request(request_data)
-    
-    start_time = time.time()
-    
-    # Validate API key
-    if not api_key or api_key.strip() == "":
-        raise ValueError("API key is required")
-    
-    # Get and map model to Groq format
-    model = request_data.get('ai_model', 'rgen_alpha_v2')
-    # Map model names to Groq models
-    model_mapping = {
-        "rgen_alpha_v2": "openai/gpt-oss-20b",  # Map rgen_alpha_v2 to Groq model
-        "gemini-2.5-flash-lite": "openai/gpt-oss-20b",
-        "gemini-2.5-flash": "openai/gpt-oss-20b"
-    }
-    if model in model_mapping:
-        model = model_mapping[model]
-    
-    # Initialize AI Service
-    try:
-        service = AIService(api_key=api_key, model=model)
-    except Exception as e:
-        raise ValueError(f"Failed to initialize AI service: {str(e)}")
-    
-    # Generate plan_id
-    plan_id = f"plan-{uuid.uuid4().hex[:8]}"
-    
-    # Single unified call to process everything
-    try:
-        # Validate data source exists
-        if not request_data.get('data_sources') or len(request_data.get('data_sources', [])) == 0:
-            raise ValueError("No data sources provided")
-        
-        # Get visualization flag
-        include_visualization = request_data.get('include_visualization', False)
-        
-        # Make single unified API call
-        unified_result, token_info = process_unified(
-            service,
-            request_data,
-            data_source_index=0,
-            include_visualization=include_visualization
-        )
-        
-        # Extract results from unified output
-        intent_result = unified_result.get('intent', {})
-        governance_result = unified_result.get('governance', {})
-        execution_plan = unified_result.get('execution_plan', {})
-        visualization_output = unified_result.get('visualization')
-        analyze_result = unified_result.get('analysis', {})
-        
-        # Validate unified result
-        if not intent_result:
-            raise ValueError("Unified processing returned empty intent result")
-        
-        if not intent_result.get('intent_type'):
-            raise ValueError("Intent classification failed: intent_type is missing")
-        
-        if not intent_result.get('source_category'):
-            raise ValueError("Intent classification failed: source_category is missing")
-        
-        if not governance_result:
-            raise ValueError("Unified processing returned empty governance result")
-        
-        if not execution_plan:
-            raise ValueError("Unified processing returned empty execution plan")
-        
-        if not execution_plan.get('operations') or len(execution_plan.get('operations', [])) == 0:
-            raise ValueError("Execution plan must contain at least one operation")
-        
-        if not analyze_result:
-            raise ValueError("Unified processing returned empty analysis result")
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "status": "error",
-                "message": "Unified processing validation failed",
-                "detail": str(e)
-            }
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"Unified processing error: {error_type}: {error_msg}")
-        print(traceback.format_exc())
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": "Unified processing failed",
-                "error": error_msg,
-                "type": error_type
-            }
-        )
-    
-    # Normalize execution plan query_payload to match expected format
-    try:
-        execution_plan = normalize_execution_plan(execution_plan, request_data)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to normalize execution plan: {str(e)}"
-        )
-    
-    # Normalize governance_applied to match expected format
-    try:
-        for operation in execution_plan.get('operations', []):
-            if not operation.get('governance_applied'):
-                raise ValueError(f"Operation {operation.get('step_id', 'unknown')} is missing governance_applied")
-            
-            gov_applied = operation.get('governance_applied', {})
-            # Ensure rls_rules and masking_rules are present (required fields)
-            # If they come from LLM as row_filters/column_masking, convert them
-            if 'rls_rules' not in gov_applied or not gov_applied.get('rls_rules'):
-                if 'row_filters' in gov_applied:
-                    # Convert row_filters to rls_rules (use filter descriptions or generate names)
-                    row_filters = gov_applied.get('row_filters', [])
-                    gov_applied['rls_rules'] = [
-                        f"rls_rule_{i+1}" if isinstance(f, str) else str(f)
-                        for i, f in enumerate(row_filters)
-                    ] if row_filters else []
-                else:
-                    gov_applied['rls_rules'] = []
-            
-            if 'masking_rules' not in gov_applied or not gov_applied.get('masking_rules'):
-                if 'column_masking' in gov_applied:
-                    # Convert column_masking list to masking_rules strings
-                    column_masking = gov_applied.get('column_masking', [])
-                    if isinstance(column_masking, list) and len(column_masking) > 0:
-                        # Extract masking rule names/descriptions
-                        masking_rules = []
-                        for mask in column_masking:
-                            if isinstance(mask, dict):
-                                column = mask.get('column', 'unknown')
-                                func = mask.get('masking_function', 'mask')
-                                masking_rules.append(f"{column}_{func}")
-                            else:
-                                masking_rules.append(str(mask))
-                        gov_applied['masking_rules'] = masking_rules
-                    else:
-                        gov_applied['masking_rules'] = []
-                else:
-                    gov_applied['masking_rules'] = []
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to normalize governance rules: {str(e)}"
-        )
-    
-    # Final generation time
-    final_generation_time_ms = int((time.time() - start_time) * 1000)
-    
-    # Extract token information
-    prompt_tokens = token_info.get('prompt_tokens', 0) if isinstance(token_info, dict) else 0
-    completion_tokens = token_info.get('completion_tokens', 0) if isinstance(token_info, dict) else 0
-    total_tokens = token_info.get('total_tokens', 0) if isinstance(token_info, dict) else (token_info if isinstance(token_info, int) else 0)
-    
-    # Map to input_tokens_used and output_tokens_used (primary fields)
-    input_tokens_used = prompt_tokens if prompt_tokens > 0 else total_tokens
-    output_tokens_used = completion_tokens if completion_tokens > 0 else 0
-    
-    # Build AI metadata from analysis result
-    ai_metadata = {
-        "model": model,
-        "confidence": analyze_result.get('confidence_score', 0.0) / 100.0 if analyze_result.get('confidence_score', 0) > 1 else analyze_result.get('confidence_score', 0.0),
-        "confidence_score": analyze_result.get('confidence_score', 0.0) / 100.0 if analyze_result.get('confidence_score', 0) > 1 else analyze_result.get('confidence_score', 0.0),
-        "input_tokens_used": input_tokens_used,
-        "output_tokens_used": output_tokens_used,
-        "generation_time_ms": final_generation_time_ms,
-        "explanation": analyze_result.get('explanation', ''),
-        "reasoning_steps": analyze_result.get('reasoning_steps', []),
-        # Backward compatibility fields
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "tokens_used": total_tokens
-    }
-    
-    # Build final response with validation
-    try:
-        # Validate required fields for response
-        if not intent_result.get('intent_type'):
-            raise ValueError("intent_type is missing from intent result")
-        
-        if not intent_result.get('intent_summary'):
-            raise ValueError("intent_summary is missing from intent result")
-        
-        final_output = {
-            "request_id": request_data.get('request_id', ''),
-            "execution_id": request_data.get('execution_id', ''),
-            "plan_id": plan_id,
-            "status": "success",
-            "timestamp": request_data.get('timestamp') or datetime.utcnow().isoformat() + "Z",
-            "intent_type": intent_result.get('intent_type', ''),
-            "intent_summary": intent_result.get('intent_summary', ''),
-            "execution_plan": execution_plan,
-            "ai_metadata": ai_metadata,
-            "suggestions": analyze_result.get('suggestions', [])
-        }
-        
-        # Only include visualization if requested and available
-        if include_visualization and visualization_output:
-            visualizations = visualization_output.get('visualizations', [])
-            if visualizations:
-                final_output["visualization"] = visualizations
-        
-        return final_output
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to build response: {str(e)}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error building response: {str(e)}"
-        )
-
-
-@app.post("/analyze", response_model=ResponseModel)
-async def analyze(request: RequestModel):
-    """
-    Main endpoint for intent classification, governance, planning, visualization, and analysis.
-    
-    This endpoint processes a user request through a unified AI agent in a single LLM API call:
-    1. Intent Classification - Determines the user's intent
-    2. Governance Application - Applies security and masking rules
-    3. Execution Planning - Creates executable database commands
-    4. Visualization Generation - Recommends visualizations (if requested)
-    5. AI Analysis - Provides confidence scores and suggestions
-    
-    All results are generated from a single Groq API call for efficiency.
-    
-    **Model Validation:**
-    - `ai_model` default is "rgen_alpha_v2" (mapped to Groq "openai/gpt-oss-20b")
-    - Also supports Groq models like "openai/gpt-oss-20b"
-    - Legacy model names "gemini-2.5-flash-lite" and "gemini-2.5-flash" are automatically mapped to "openai/gpt-oss-20b"
+    This endpoint processes a user request through AI agents to:
+    1. Classify user intent
+    2. Apply governance rules (RLS and column masking)
+    3. Generate execution plans with actual database queries
+    4. Recommend visualizations (if requested)
+    5. Provide AI analysis with confidence scores
     
     **Request Validation:**
-    - All required fields are validated
-    - Data sources, schemas, tables, and columns are validated
-    - User context is validated
-    - Appropriate exceptions are raised for any validation failures
+    - All data source types must be from supported categories (SQL, NoSQL, or Cloud Warehouse)
+    - AI model is validated
+    - All required fields are validated using Pydantic
     
-    Returns a complete response with execution plan, visualizations, and analysis.
+    **Response:**
+    - Returns a complete ExecutionResponse with execution plan, visualizations, and metadata
+    - Includes request_id, execution_id, status, and timestamp (added in post-processing)
     """
+    request_start_time = time.time()
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    
     try:
-        # Get API key from environment variable (Groq API key)
+        logger.info(
+            f"Analyze request received - Request ID: {request.request_id}, "
+            f"IP: {client_ip}, Prompt: {request.user_prompt[:100]}..."
+        )
+        
+        # Get API key from environment variable
         api_key = os.getenv("GROQ_API_KEY")
         
         if not api_key or api_key.strip() == "":
+            logger.error("GROQ_API_KEY not found in environment variables")
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="API key is required. Please set GROQ_API_KEY in your .env file or environment variables."
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="API configuration error. Please contact administrator."
             )
         
-        # Convert Pydantic model to dict (Pydantic already validated the structure)
-        request_data = request.model_dump()
+        # Convert Pydantic model to dict
+        request_dict = request.model_dump()
         
-        # Process the request (includes comprehensive validation)
-        response_data = process_request(request_data, api_key)
+        # Check cache first (if caching is enabled)
+        use_cache = os.getenv("ENABLE_CACHE", "true").lower() == "true"
+        cache_key = None
+        cached_response = None
         
-        # Validate and return response
+        if use_cache:
+            cache_key = generate_cache_key(request_dict)
+            cached_response = get_cached_response(cache_key)
+            if cached_response:
+                logger.info(f"Cache hit for request: {request.request_id}")
+                # Update timestamp and IDs for cached response
+                cached_response['request_id'] = request_dict['request_id']
+                cached_response['execution_id'] = request_dict['execution_id']
+                cached_response['timestamp'] = datetime.now()
+                return ExecutionResponse.model_validate(cached_response)
+        
+        # Get database information for the first data source
         try:
-            return ResponseModel(**response_data)
-        except ValidationError as e:
-            # If response validation fails, return raw response with warning
-            response_data["status"] = "partial_success"
-            response_data["validation_warning"] = "Response validation failed, returning raw data"
-            response_data["validation_errors"] = [err.get("msg") for err in e.errors()]
-            return JSONResponse(content=response_data)
+            databasetype, query_pattern, intent_types = await getdatabase(
+                request_dict['data_sources'][0]['type']
+            )
+            logger.debug(f"Database type determined: {databasetype} for request: {request.request_id}")
+        except Exception as e:
+            logger.error(f"Failed to determine database type for request {request.request_id}: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid database type: {str(e)}"
+            )
+        
+        # Get prompts
+        include_visualization = request_dict.get("include_visualization", False)
+        try:
+            system_prompt = await get_system_prompt()
+            user_prompt = await prepare_prompt(
+                databasetype=databasetype,
+                database_source=request_dict["data_sources"][0],
+                intent_types=intent_types,
+                query_pattern=query_pattern,
+                user_context=request_dict["user_context"],
+                user_prompt=request_dict["user_prompt"],
+                governance_policies=request_dict["data_sources"][0].get("governance_policies", {}),
+                execution_context=request_dict.get("execution_context", {}),
+                selected_schema_names=request_dict.get("selected_schema_names", []),
+                include_visualization=include_visualization
+            )
+            logger.debug(f"Prompts prepared successfully for request: {request.request_id}")
+        except Exception as e:
+            logger.error(f"Failed to prepare prompts for request {request.request_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to prepare prompts"
+                )
+            
+        # Initialize AI service
+        try:
+            ai_service = AIService(
+                api_key=api_key,
+                model=request_dict.get("ai_model", "meta-llama/llama-4-scout-17b-16e-instruct")
+            )
+        except AIServiceError as e:
+            logger.error(f"Failed to initialize AI service: {str(e)}")
+            raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="AI service initialization failed"
+            )
+        
+        # Generate response using LLM schema (without post-processing fields)
+        # Retry logic is handled inside AIService.generate_response
+        # This is async and can handle multiple concurrent requests
+        try:
+            logger.debug(f"Calling LLM service for request: {request.request_id}")
+            llm_response_dict, token_info = await ai_service.generate_response(
+                system_instruction=system_prompt,
+                prompt=user_prompt,
+                output_schema=ExecutionResponseLLM,
+                max_completion_tokens=4096,
+                timeout=int(request_dict.get("execution_context", {}).get("timeout_seconds", 120))
+            )
+            logger.debug(f"LLM service completed for request: {request.request_id}")
+        except AIServiceError as e:
+            logger.error(f"LLM generation failed after retries: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI service temporarily unavailable. Please try again later."
+            )
+        
+        # Set visualization to null if include_visualization is false
+        if not include_visualization:
+            llm_response_dict['visualization'] = None
+        
+        # Build full response with post-processing fields at the top
+        # Generate unique plan_id if not provided by LLM
+        plan_id = llm_response_dict.get('plan_id') or f"plan-{uuid.uuid4().hex[:12]}"
+        
+        response_dict = {
+            'request_id': request_dict.get('request_id', ''),
+            'execution_id': request_dict.get('execution_id', ''),
+            'plan_id': plan_id,
+            'status': 'success',
+            'timestamp': datetime.now(),
+            **llm_response_dict  # Add all LLM response fields
+        }
+        
+        # Add ai_metadata fields that are not in the LLM schema
+        if not response_dict.get('ai_metadata'):
+            response_dict['ai_metadata'] = {}
+        
+        # Add post-processing fields to ai_metadata
+        response_dict['ai_metadata']['model'] = request_dict.get('ai_model', 'meta-llama/llama-4-scout-17b-16e-instruct')
+        response_dict['ai_metadata']['input_tokens'] = token_info.get('prompt_tokens', 0)
+        response_dict['ai_metadata']['output_tokens'] = token_info.get('completion_tokens', 0)
+        response_dict['ai_metadata']['generation_time_ms'] = token_info.get('generation_time_ms', 0)
+        
+        # Validate and return response using ExecutionResponse model
+        try:
+            response = ExecutionResponse.model_validate(response_dict)
+            logger.debug(f"Response validated successfully for request: {request.request_id}")
+        except Exception as e:
+            logger.error(
+                f"Response validation failed for request {request.request_id}: {str(e)}",
+                exc_info=True
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Response validation failed: {str(e)}"
+            )
+        
+        # Cache the response if caching is enabled
+        if use_cache and cache_key:
+            try:
+                cache_response(cache_key, response_dict)
+                logger.debug(f"Cached response for request: {request.request_id} (key: {cache_key[:16]}...)")
+            except Exception as e:
+                logger.warning(f"Failed to cache response for request {request.request_id}: {str(e)}")
+        
+        # Log successful request with performance metrics
+        request_time_ms = int((time.time() - request_start_time) * 1000)
+        logger.info(
+            f"✓ Analyze request completed - Request ID: {request.request_id}, "
+            f"IP: {client_ip}, Time: {request_time_ms}ms, "
+            f"Tokens: {token_info.get('prompt_tokens', 0)}+{token_info.get('completion_tokens', 0)}"
+        )
+        
+        return response
         
     except HTTPException:
-        # Re-raise HTTP exceptions (they already have proper status codes)
+        # Re-raise HTTP exceptions (already handled)
         raise
     except ValueError as e:
-        # Value errors are validation/bad request errors
+        # Validation errors
+        logger.warning(f"Validation error for request {request.request_id}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "status": "error",
-                "message": "Request validation failed",
-                "detail": str(e)
-            }
+            detail=str(e)
         )
     except Exception as e:
-        # Log the full traceback for debugging
-        error_detail = {
-            "status": "error",
-            "message": "Error processing request",
-            "error": str(e),
-            "type": type(e).__name__
-        }
-        print(f"Error processing request: {traceback.format_exc()}")
+        # Unexpected errors
+        request_time_ms = int((time.time() - request_start_time) * 1000)
+        error_id = str(uuid.uuid4())
+        logger.error(
+            f"Unexpected error processing request {request.request_id} "
+            f"(Error ID: {error_id}, Time: {request_time_ms}ms): {str(e)}",
+            exc_info=True
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_detail
+            detail=f"Error processing request. Error ID: {error_id}"
         )
 
 
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "rivergen-psa"}
 
 
 if __name__ == "__main__":
