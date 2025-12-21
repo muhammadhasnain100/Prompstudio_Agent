@@ -179,13 +179,22 @@ class RequestModel(BaseModel):
 
     @model_validator(mode='after')
     def validate_data_source_types(self):
-        """Validate that all data source types are from supported categories (SQL, NoSQL, or Cloud Warehouse)."""
+        """Validate that all data source types are from supported categories."""
         # These must match exactly the types defined in prompts.py
         SQL_TYPES = {"postgresql", "mysql", "mariadb", "sqlserver", "oracle"}
         CLOUD_WAREHOUSE_TYPES = {"snowflake", "bigquery", "redshift", "synapse", "databricks"}
         NOSQL_TYPES = {"mongodb", "cassandra", "redis", "dynamodb", "elasticsearch"}
+        CLOUD_STORAGE_TYPES = {"s3", "azure_blob", "gcs", "azure_blob_storage", "google_cloud_storage"}
+        FILE_FORMAT_TYPES = {"file", "csv", "excel", "xlsx", "xls", "json", "parquet", "orc", "delta", "iceberg", "hudi"}
+        SAAS_API_TYPES = {"salesforce", "hubspot", "stripe", "jira", "servicenow", "rest", "graphql", "api"}
+        STREAM_TYPES = {"kafka", "kinesis"}
+        VECTOR_TYPES = {"vector", "pinecone", "weaviate", "qdrant"}
         
-        SUPPORTED_TYPES = SQL_TYPES | CLOUD_WAREHOUSE_TYPES | NOSQL_TYPES
+        SUPPORTED_TYPES = (
+            SQL_TYPES | CLOUD_WAREHOUSE_TYPES | NOSQL_TYPES | 
+            CLOUD_STORAGE_TYPES | FILE_FORMAT_TYPES | SAAS_API_TYPES | 
+            STREAM_TYPES | VECTOR_TYPES
+        )
         
         invalid_types = []
         for data_source in self.data_sources:
@@ -198,7 +207,12 @@ class RequestModel(BaseModel):
                 f"Unsupported data source type(s): {', '.join(invalid_types)}. "
                 f"Supported types are: SQL databases ({', '.join(sorted(SQL_TYPES))}), "
                 f"Cloud Warehouses ({', '.join(sorted(CLOUD_WAREHOUSE_TYPES))}), "
-                f"and NoSQL databases ({', '.join(sorted(NOSQL_TYPES))})"
+                f"NoSQL databases ({', '.join(sorted(NOSQL_TYPES))}), "
+                f"Cloud Storage ({', '.join(sorted(CLOUD_STORAGE_TYPES))}), "
+                f"File Formats ({', '.join(sorted(FILE_FORMAT_TYPES))}), "
+                f"SaaS/APIs ({', '.join(sorted(SAAS_API_TYPES))}), "
+                f"Streams ({', '.join(sorted(STREAM_TYPES))}), "
+                f"and Vector databases ({', '.join(sorted(VECTOR_TYPES))})"
             )
         
         return self
@@ -272,7 +286,7 @@ async def analyze(request: RequestModel, http_request: Request):
     5. Provide AI analysis with confidence scores
     
     **Request Validation:**
-    - All data source types must be from supported categories (SQL, NoSQL, or Cloud Warehouse)
+    - All data source types must be from supported categories (SQL, Cloud Warehouse, NoSQL, Cloud Storage, File Formats, SaaS/APIs, Streams, Vector databases)
     - AI model is validated
     - All required fields are validated using Pydantic
     
@@ -352,8 +366,8 @@ async def analyze(request: RequestModel, http_request: Request):
             logger.error(f"Failed to prepare prompts for request {request.request_id}: {str(e)}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to prepare prompts"
-                )
+                detail="Failed to prepare prompts"
+            )
             
         # Initialize AI service
         try:
@@ -364,7 +378,7 @@ async def analyze(request: RequestModel, http_request: Request):
         except AIServiceError as e:
             logger.error(f"Failed to initialize AI service: {str(e)}")
             raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="AI service initialization failed"
             )
         

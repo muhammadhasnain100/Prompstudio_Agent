@@ -7,6 +7,11 @@ import json
 SQL_TYPES = {"postgresql", "mysql", "mariadb", "sqlserver", "oracle"}
 CLOUD_WAREHOUSE_TYPES = {"snowflake", "bigquery", "redshift", "synapse", "databricks"}
 NOSQL_TYPES = {"mongodb", "cassandra", "redis", "dynamodb", "elasticsearch"}
+CLOUD_STORAGE_TYPES = {"s3", "azure_blob", "gcs", "azure_blob_storage", "google_cloud_storage"}
+FILE_FORMAT_TYPES = {"file", "csv", "excel", "xlsx", "xls", "json", "parquet", "orc", "delta", "iceberg", "hudi"}
+SAAS_API_TYPES = {"salesforce", "hubspot", "stripe", "jira", "servicenow", "rest", "graphql", "api"}
+STREAM_TYPES = {"kafka", "kinesis"}
+VECTOR_TYPES = {"vector", "pinecone", "weaviate", "qdrant"}
 
 # Intent type definitions
 SQL_INTENT_TYPES: List[str] = [
@@ -33,6 +38,38 @@ NON_SQL_INTENT_TYPES: List[str] = [
     "stream",
     "governance",
     "schema_inspection",
+]
+
+FILE_INTENT_TYPES: List[str] = [
+    "query",
+    "transform",
+    "aggregate",
+    "join",
+    "pipeline",
+    "schema_inspection",
+]
+
+API_INTENT_TYPES: List[str] = [
+    "query",
+    "write",
+    "aggregate",
+    "pipeline",
+    "schema_inspection",
+]
+
+STREAM_INTENT_TYPES: List[str] = [
+    "query",
+    "stream",
+    "aggregate",
+    "transform",
+    "pipeline",
+]
+
+VECTOR_INTENT_TYPES: List[str] = [
+    "query",
+    "search",
+    "similarity",
+    "aggregate",
 ]
 
 # Query patterns - simplified version
@@ -168,13 +205,324 @@ NON_SQL_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
     }
 }
 
+# Cloud Storage / Data Lake query patterns
+CLOUD_STORAGE_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "s3": {
+        "query": "SELECT * FROM read_parquet('s3://bucket/path/**/*.parquet', hive_partitioning=true) WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_parquet('s3://bucket/path/*.parquet') GROUP BY column",
+        "partition_filter": "WHERE partition_column >= '2025-01-01' AND partition_column <= '2025-01-31'",
+        "note": "Use DuckDB or Trino for S3 queries, support Hive partitioning, partition pruning recommended",
+        "engine": "duckdb, trino"
+    },
+    "azure_blob": {
+        "query": "SELECT * FROM read_parquet('az://container/path/**/*.parquet') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_parquet('az://container/path/*.parquet') GROUP BY column",
+        "partition_filter": "WHERE partition_column >= '2025-01-01' AND partition_column <= '2025-01-31'",
+        "note": "Use DuckDB or Trino for Azure Blob queries, support partitioning",
+        "engine": "duckdb, trino"
+    },
+    "gcs": {
+        "query": "SELECT * FROM read_parquet('gs://bucket/path/**/*.parquet') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_parquet('gs://bucket/path/*.parquet') GROUP BY column",
+        "partition_filter": "WHERE partition_column >= '2025-01-01' AND partition_column <= '2025-01-31'",
+        "note": "Use DuckDB or Trino for GCS queries, support partitioning",
+        "engine": "duckdb, trino"
+    }
+}
+
+# File format query patterns
+FILE_FORMAT_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "csv": {
+        "query": "SELECT * FROM read_csv('path/to/file.csv', header=true, delim=',') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_csv('file.csv') GROUP BY column",
+        "options": "header=true/false, delim=',', skip_rows=0, quote='\"'",
+        "engine": "duckdb, pandas"
+    },
+    "excel": {
+        "query": "SELECT * FROM read_excel('path/to/file.xlsx', sheet_name='Sheet1') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_excel('file.xlsx') GROUP BY column",
+        "options": "sheet_name, header_row, usecols",
+        "engine": "pandas, openpyxl"
+    },
+    "json": {
+        "query": "SELECT * FROM read_json('path/to/file.json', format='newline_delimited') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_json('file.json') GROUP BY column",
+        "options": "format='newline_delimited' or 'array', columns",
+        "engine": "duckdb, pandas"
+    },
+    "parquet": {
+        "query": "SELECT * FROM read_parquet('path/to/file.parquet') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM read_parquet('file.parquet') GROUP BY column",
+        "partition_filter": "Apply partition pruning when files are partitioned",
+        "engine": "duckdb, pyarrow"
+    },
+    "delta": {
+        "query": "SELECT * FROM delta_table('path/to/delta_table') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM delta_table('delta_table') GROUP BY column",
+        "version": "Support time travel queries with VERSION AS OF or TIMESTAMP AS OF",
+        "engine": "delta-rs, databricks"
+    },
+    "iceberg": {
+        "query": "SELECT * FROM iceberg_table('catalog.schema.table') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM iceberg_table('table') GROUP BY column",
+        "snapshot": "Support time travel with snapshot_id",
+        "engine": "pyiceberg, spark"
+    },
+    "hudi": {
+        "query": "SELECT * FROM hudi_table('path/to/hudi_table') WHERE condition",
+        "aggregate": "SELECT column, SUM(amount) FROM hudi_table('table') GROUP BY column",
+        "view_type": "Support read_optimized, real_time, or snapshot view types",
+        "engine": "hudi, spark"
+    }
+}
+
+# SaaS / API query patterns
+SAAS_API_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "salesforce": {
+        "query": "SELECT Id, Name, Amount FROM Opportunity WHERE Amount > 10000",
+        "query_language": "SOQL (Salesforce Object Query Language)",
+        "api_endpoint": "/services/data/v58.0/query",
+        "method": "GET",
+        "filter": "WHERE conditions in SOQL syntax",
+        "note": "Use SOQL syntax, REST API endpoint, handle pagination with nextRecordsUrl"
+    },
+    "hubspot": {
+        "query": "GET /crm/v3/objects/contacts?properties=email,firstname,lastname&limit=100",
+        "filter": "Use query parameters: property filters, associations",
+        "pagination": "Use 'after' parameter for cursor-based pagination",
+        "note": "REST API with query parameters, support filtering and associations"
+    },
+    "stripe": {
+        "query": "GET /v1/charges?status=succeeded&created[gte]=1735689600&limit=100",
+        "filter": "Query parameters for filtering: status, created[gte/lte], etc.",
+        "pagination": "Cursor-based pagination with 'starting_after' parameter",
+        "note": "REST API, Unix timestamps for dates, cursor pagination"
+    },
+    "jira": {
+        "query": "GET /rest/api/3/search?jql=project=PROJ&maxResults=100",
+        "filter": "JQL (Jira Query Language) in jql parameter",
+        "pagination": "Use 'startAt' and 'maxResults' parameters",
+        "note": "REST API, JQL for querying issues, pagination support"
+    },
+    "servicenow": {
+        "query": "GET /api/now/table/incident?sysparm_query=priority=1&sysparm_limit=100",
+        "filter": "ServiceNow query syntax in sysparm_query parameter",
+        "pagination": "Use sysparm_offset and sysparm_limit",
+        "note": "REST API, ServiceNow query syntax, offset-based pagination"
+    },
+    "rest": {
+        "query": "GET /api/endpoint?param1=value1&param2=value2",
+        "method": "GET, POST, PUT, DELETE, PATCH",
+        "filter": "Query parameters, request body for POST/PUT",
+        "pagination": "Varies by API: offset/limit, cursor-based, page-based",
+        "note": "Generic REST API, adapt to specific API documentation"
+    },
+    "graphql": {
+        "query": "query { field1 field2 { nestedField } }",
+        "filter": "Use GraphQL query arguments and filters",
+        "pagination": "Use cursor-based pagination with first/after or offset/limit",
+        "note": "GraphQL query language, use query variables for parameters"
+    }
+}
+
+# Stream query patterns
+STREAM_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "kafka": {
+        "operation": "consume",
+        "topic": "topic_name",
+        "consumer_group": "consumer_group_name",
+        "offset": "earliest, latest, or specific offset",
+        "limit": "Number of messages to consume",
+        "filter": "Filter messages by key, value, headers using consumer-side filtering",
+        "note": "Kafka consumer API, support consumer groups, offset management"
+    },
+    "kinesis": {
+        "operation": "get_records",
+        "stream_name": "stream_name",
+        "shard_iterator": "Shard iterator from get_shard_iterator",
+        "limit": "Number of records to retrieve",
+        "filter": "Filter records by partition key or data",
+        "note": "AWS Kinesis API, use shard iterators, support multiple shards"
+    }
+}
+
+# Vector database query patterns
+VECTOR_QUERY_PATTERNS: Dict[str, Dict[str, str]] = {
+    "pinecone": {
+        "operation": "query",
+        "index_name": "index_name",
+        "query_vector": "Vector embedding or generate from text",
+        "top_k": "Number of similar vectors to return",
+        "filter": "Metadata filtering using Pinecone filter expressions",
+        "include_metadata": "Include metadata in results",
+        "note": "Vector similarity search, support text-to-vector via embedding model"
+    },
+    "weaviate": {
+        "operation": "GraphQL query",
+        "query": "Get { Class { property1 property2 _additional { vector } } }",
+        "nearVector": "Vector similarity search",
+        "nearText": "Text-based semantic search",
+        "where": "Filter by metadata properties",
+        "note": "GraphQL API, support vector and text-based search"
+    },
+    "qdrant": {
+        "operation": "search",
+        "collection_name": "collection_name",
+        "query_vector": "Vector embedding",
+        "limit": "Number of results",
+        "filter": "Qdrant filter conditions",
+        "note": "REST API, vector similarity search with filtering"
+    }
+}
+
+
+def _get_operation_type_requirements(databasetype: str) -> str:
+    """
+    Get operation type-specific requirements based on database category.
+    Returns only the requirements relevant to the specific data source type.
+    """
+    requirements_map = {
+        "sql": """1. **SQL/Cloud Warehouse Operations**: Include 'query' field with SQL statement, 'query_payload' with language/dialect/statement. For write operations, include 'write_operation' object with operation type, table, values/set, where conditions.
+7. **Write Operations**: For INSERT/UPDATE/DELETE/UPSERT, include 'write_operation' object with operation ("insert"/"update"/"delete"/"upsert"), table, values (for INSERT), set (for UPDATE), where (for UPDATE/DELETE), returning fields. Also include standard 'query' and 'query_payload' with DML statement.
+""",
+        "cloud_warehouse": """1. **SQL/Cloud Warehouse Operations**: Include 'query' field with SQL statement, 'query_payload' with language/dialect/statement. For write operations, include 'write_operation' object with operation type, table, values/set, where conditions.
+7. **Write Operations**: For INSERT/UPDATE/DELETE/UPSERT, include 'write_operation' object with operation ("insert"/"update"/"delete"/"upsert"), table, values (for INSERT), set (for UPDATE), where (for UPDATE/DELETE), returning fields. Also include standard 'query' and 'query_payload' with DML statement.
+""",
+        "nosql": """2. **NoSQL Operations**: Include 'query' field with NoSQL query, 'query_payload' with language (mongodb/cql/dynamodb/elasticsearch/redis). Include 'nosql_operations' object with database-specific query structure (e.g., MongoDB: database, collection, query, projection, sort, limit).
+7. **Write Operations**: For INSERT/UPDATE/DELETE/UPSERT, include 'write_operation' or 'nosql_operations' object with appropriate write operation structure. Also include standard 'query' and 'query_payload' with write command.
+""",
+        "cloud_storage": """3. **File/Cloud Storage Operations**: Include 'file_operations' object with storage_type (s3/azure_blob/gcs), file_path/bucket/paths, file_format (parquet/csv/json/excel), partition_filter (if applicable), csv_options or format-specific options. Include 'query' with SQL over read functions and 'query_payload' with SQL statement.
+""",
+        "file_format": """3. **File/Cloud Storage Operations**: Include 'file_operations' object with file_path, file_format (csv/excel/json/parquet/delta/iceberg/hudi), format-specific options (csv_options, sheet_name for Excel, etc.). Include 'query' with SQL over read functions and 'query_payload' with SQL statement.
+""",
+        "saas_api": """4. **API Operations**: Include 'api_operations' object with api_type (salesforce/hubspot/stripe/jira/servicenow/rest/graphql), endpoint, method (GET/POST/PUT/DELETE), query_params or body, pagination configuration. Include 'query_payload' with language (soql/rest/graphql), endpoint, method, query_params.
+""",
+        "stream": """5. **Stream Operations**: Include 'stream_operations' object with stream_type (kafka/kinesis), topic/stream_name, operation (consume/get_records), consumer_group (Kafka), offset/shard_iterator, limit. Include 'query_payload' with language (kafka/kinesis), topic/stream_name, offset, limit.
+""",
+        "vector": """6. **Vector Operations**: Include 'vector_operations' object with vector_db_type (pinecone/weaviate/qdrant), index_name/collection_name, operation (query/search), query_vector or query_text with embedding_model, top_k/limit, filter, include_metadata. Include 'query_payload' with language (vector), operation, query_text (if applicable), top_k, similarity_threshold.
+"""
+    }
+    
+    return requirements_map.get(databasetype, """**General Operations**: Include appropriate operation-specific objects based on the data source metadata and query patterns provided.
+""")
+
+
+def _get_data_source_type_instructions(databasetype: str) -> str:
+    """
+    Get data source type-specific instructions based on database category.
+    Returns only the instructions relevant to the specific data source type.
+    """
+    instructions_map = {
+        "sql": """**SQL DATABASES** (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle):
+- Use standard SQL syntax with database-specific dialects
+- Apply RLS conditions in WHERE clauses or CTEs
+- Use CASE expressions for column masking
+- Support JOINs, aggregations, window functions
+- Generate complete SQL statements in the 'query' field
+- Use appropriate date/time functions for the specific SQL dialect
+- Ensure SQL syntax matches the database type exactly
+- For write operations (INSERT/UPDATE/DELETE), extract values from user prompt and construct DML statements
+- Include RETURNING clause when supported (PostgreSQL) or use SELECT after write operations
+""",
+        "cloud_warehouse": """**CLOUD WAREHOUSES** (Snowflake, BigQuery, Redshift, Synapse, Databricks):
+- Use SQL syntax with warehouse-specific features
+- Support three-part naming (database.schema.table) or project.dataset.table format
+- Leverage warehouse-specific functions (QUALIFY, PIVOT, ARRAY_AGG, etc.)
+- Apply RLS and masking similar to SQL databases
+- Consider warehouse compute resources and optimization
+- Support large-scale aggregations and window functions
+- Use warehouse-specific date/time functions
+- For Snowflake: Include warehouse specification if needed
+- For BigQuery: Use backticks for project.dataset.table names
+- For write operations: Support INSERT, UPDATE, DELETE, MERGE/UPSERT
+""",
+        "nosql": """**NOSQL DATABASES** (MongoDB, Cassandra, DynamoDB, Elasticsearch, Redis):
+- Use NoSQL query syntax appropriate for the database type
+- MongoDB: Use find() or aggregate() with $match, $group, $project operators
+- Cassandra: Use CQL with partition key in WHERE clause (required)
+- DynamoDB: Use Query/Scan with KeyConditionExpression and FilterExpression
+- Elasticsearch: Use JSON query DSL with query and aggs structures
+- Redis: Use key-based operations (GET, HGET, SCAN) or Lua scripts
+- Apply RLS through filter conditions in queries
+- Apply masking in $project (MongoDB) or application layer
+- For write operations: Use appropriate NoSQL write operations (insertOne/insertMany, updateOne/updateMany, deleteOne/deleteMany for MongoDB)
+- Generate query_payload with language="mongodb"/"cql"/"dynamodb"/"elasticsearch"/"redis"
+""",
+        "cloud_storage": """**CLOUD STORAGE / DATA LAKES** (S3, Azure Blob, Google Cloud Storage):
+- Use DuckDB or Trino SQL to query files in cloud storage
+- Support partitioned data (Hive partitioning) with partition pruning
+- Use read_parquet() or similar functions with cloud storage paths
+- Apply partition filters to reduce data scanning
+- Path patterns: s3://bucket/path/**/*.parquet, az://container/path, gs://bucket/path
+- Compute type should be "internal" with compute_engine "internal_duckdb" or "internal_trino"
+- Support file formats: Parquet, ORC, CSV, JSON
+- For aggregations: Push down GROUP BY and aggregation functions
+- Include partition_filter in query_payload for optimization
+- Generate file_operations object with storage_type, bucket, paths, file_format
+""",
+        "file_format": """**FILE FORMATS** (CSV, Excel, JSON, Parquet, ORC, Delta Lake, Iceberg, Hudi):
+- Use appropriate read functions: read_csv(), read_excel(), read_json(), read_parquet()
+- Compute type: "internal" with compute_engine "internal_duckdb" or "pandas"
+- For CSV: Specify header, delimiter, quote characters in options
+- For Excel: Specify sheet_name, header_row in options
+- For JSON: Support newline-delimited or array formats
+- For Parquet: Support partition pruning and column filtering
+- For Delta Lake: Support time travel with VERSION AS OF or TIMESTAMP AS OF
+- For Iceberg: Support snapshot queries and time travel
+- For Hudi: Support different view types (read_optimized, real_time, snapshot)
+- Generate file_operations object with file_path, file_format, and format-specific options
+- Apply filters and aggregations using SQL over read functions
+""",
+        "saas_api": """**SAAS / APIs** (Salesforce, HubSpot, Stripe, Jira, ServiceNow, REST, GraphQL):
+- Generate API calls with appropriate endpoints and methods
+- Salesforce: Use SOQL queries, endpoint /services/data/v58.0/query, method GET
+- HubSpot: Use REST API with query parameters, GET /crm/v3/objects/{object_type}
+- Stripe: Use REST API with query parameters, GET /v1/{resource} with Unix timestamps
+- Jira: Use REST API with JQL in jql parameter, GET /rest/api/3/search
+- ServiceNow: Use REST API with ServiceNow query syntax, GET /api/now/table/{table}
+- Generic REST: Adapt to specific API documentation, use query parameters or request body
+- GraphQL: Use GraphQL query language with query variables
+- Handle pagination (cursor-based, offset-based, or page-based depending on API)
+- Generate api_operations object with api_type, endpoint, method, query_params/body
+- Generate query_payload with language="soql"/"rest"/"graphql", endpoint, method, parameters
+- Compute type: "source_native" since APIs execute externally
+""",
+        "stream": """**STREAM SOURCES** (Kafka, Kinesis):
+- Kafka: Use consumer API, specify topic, consumer_group, offset (earliest/latest/specific), limit
+- Kinesis: Use get_records API, specify stream_name, shard_iterator, limit
+- Operation type: "read" with type "stream_consume"
+- Generate stream_operations object with stream_type, topic/stream_name, operation, offset/shard_iterator, limit
+- Generate query_payload with language="kafka"/"kinesis", topic/stream_name, offset, limit
+- Compute type: "source_native" since streams are consumed from source
+- Apply filters on consumed messages if needed (consumer-side filtering)
+- Consider real-time processing and windowing for aggregations
+""",
+        "vector": """**VECTOR DATABASES** (Pinecone, Weaviate, Qdrant):
+- Generate vector similarity search queries
+- Pinecone: Use query operation with query_vector, top_k, filter, include_metadata
+- Weaviate: Use GraphQL queries with nearVector or nearText for semantic search
+- Qdrant: Use search operation with query_vector, limit, filter
+- If query text provided, specify embedding model to generate vector from text
+- Generate vector_operations object with vector_db_type, index_name/collection_name, operation, query_vector, top_k/limit
+- Generate query_payload with language="vector", operation, query_text (if applicable), top_k, similarity_threshold
+- Compute type: "source_native" since vector search executes on vector database
+- Support metadata filtering in addition to vector similarity
+"""
+    }
+    
+    return instructions_map.get(databasetype, """**UNKNOWN DATA SOURCE TYPE**:
+- Use appropriate query syntax based on the data source metadata provided
+- Apply governance policies as specified
+- Generate execution plan based on available schema information
+""")
+
 
 async def getdatabase(db_type: str) -> Tuple[str, Dict[str, str], List[str]]:
     """
     Determine database category, query patterns, and intent types.
     
     Args:
-        db_type: Database type (e.g., "postgresql", "snowflake", "mongodb")
+        db_type: Database type (e.g., "postgresql", "snowflake", "mongodb", "s3", "csv", "salesforce", "kafka", "pinecone")
     
     Returns:
         Tuple of (databasetype, query_pattern, intent_types)
@@ -193,6 +541,39 @@ async def getdatabase(db_type: str) -> Tuple[str, Dict[str, str], List[str]]:
         databasetype = "nosql"
         intent_types = NON_SQL_INTENT_TYPES
         query_pattern = NON_SQL_QUERY_PATTERNS.get(db_type_lower, {})
+    elif db_type_lower in CLOUD_STORAGE_TYPES:
+        databasetype = "cloud_storage"
+        intent_types = FILE_INTENT_TYPES
+        query_pattern = CLOUD_STORAGE_QUERY_PATTERNS.get(db_type_lower, {})
+    elif db_type_lower in FILE_FORMAT_TYPES:
+        databasetype = "file_format"
+        intent_types = FILE_INTENT_TYPES
+        # Map common file format names to their patterns
+        format_mapping = {
+            "file": "csv",  # Default for generic "file" type
+            "excel": "excel",
+            "xlsx": "excel",
+            "xls": "excel"
+        }
+        pattern_key = format_mapping.get(db_type_lower, db_type_lower)
+        query_pattern = FILE_FORMAT_QUERY_PATTERNS.get(pattern_key, {})
+    elif db_type_lower in SAAS_API_TYPES:
+        databasetype = "saas_api"
+        intent_types = API_INTENT_TYPES
+        query_pattern = SAAS_API_QUERY_PATTERNS.get(db_type_lower, {})
+    elif db_type_lower in STREAM_TYPES:
+        databasetype = "stream"
+        intent_types = STREAM_INTENT_TYPES
+        query_pattern = STREAM_QUERY_PATTERNS.get(db_type_lower, {})
+    elif db_type_lower in VECTOR_TYPES:
+        databasetype = "vector"
+        intent_types = VECTOR_INTENT_TYPES
+        # Map common vector DB names to their patterns
+        vector_mapping = {
+            "vector": "pinecone"  # Default for generic "vector" type
+        }
+        pattern_key = vector_mapping.get(db_type_lower, db_type_lower)
+        query_pattern = VECTOR_QUERY_PATTERNS.get(pattern_key, {})
     else:
         databasetype = "unknown"
         intent_types = []
@@ -425,6 +806,37 @@ Repeat for clarity:
 - Selected schemas: {selected_schema_names}
 
 ════════════════════════════════════════════════════════════
+SECTION 1B: DATA SOURCE TYPE-SPECIFIC INSTRUCTIONS
+════════════════════════════════════════════════════════════
+
+**CRITICAL**: The database category "{databasetype}" determines how you construct queries and execution plans. Follow the type-specific instructions below based on the database category.
+
+{_get_data_source_type_instructions(databasetype)}
+
+**MULTI-SOURCE OPERATIONS** (Federated Queries):
+- When multiple data_sources are provided in the request:
+- Generate multiple operations (one per data source) with appropriate step numbers
+- Use dependencies to chain operations (later steps depend on earlier ones)
+- For joins across sources: First operation reads from source 1, second reads from source 2, third performs join using internal compute (DuckDB/Trino)
+- Compute type for reads: "source_native" for each source
+- Compute type for joins/transforms: "internal" with compute_engine "internal_duckdb"
+- Ensure output_artifact names are unique and dependencies reference correct step_ids
+- Apply governance policies independently to each source operation
+
+**WRITE OPERATIONS** (INSERT, UPDATE, DELETE, UPSERT):
+- Detect write intent from user prompt keywords: "insert", "add", "create", "update", "modify", "delete", "remove", "upsert"
+- Extract values to insert/update from the user prompt
+- For INSERT: Extract column values from prompt, omit auto-increment/default columns, generate INSERT statement
+- For UPDATE: Extract SET clause values and WHERE conditions from prompt, generate UPDATE statement
+- For DELETE: Extract WHERE conditions from prompt, generate DELETE statement
+- For UPSERT/MERGE: Extract ON conflict/match conditions, INSERT and UPDATE values, generate MERGE/UPSERT statement
+- Include RETURNING clause when supported to return affected rows
+- Set operation_type to "write" (not "read")
+- Generate write_operation object with operation ("insert"/"update"/"delete"/"upsert"), table, values/set, where conditions
+- Apply audit logging and change tracking in governance_applied
+- Generate write_summary in response if available (rows_affected, rows_inserted, rows_updated, rows_deleted)
+
+════════════════════════════════════════════════════════════
 SECTION 2: USER CONTEXT & ACCESS CONTROL (CRITICAL)
 ════════════════════════════════════════════════════════════
 User context (roles, permissions, attributes):
@@ -546,7 +958,7 @@ SECTION 6: EXECUTION PLAN CONSTRUCTION (STEP-BY-STEP DETAILED)
 
 **OPERATION CONSTRUCTION REQUIREMENTS**: Each operation in the execution plan must be a complete, executable unit that can run independently (subject to its dependencies). You must provide a step number (starting from 1), a unique step_id (such as "step_1", "op1", "query_initial"), an operation_type (such as "read", "write", "transform", "join"), and a type (such as "source_query", "transform", "aggregate"). The description field should provide a clear, paragraph-length explanation of what this operation accomplishes, why it is necessary, and how it fits into the overall execution plan. For example: "This operation retrieves customer records from the customers table, applying row-level security filters to ensure the user only sees customers in their assigned regions, and applies email masking for customers outside the user's assigned region to protect PII data."
 
-**QUERY AND QUERY_PAYLOAD CONSTRUCTION**: The query field must contain the complete, executable SQL statement (or NoSQL query command) with all governance rules embedded. The query must use the correct SQL dialect for {databasetype}, including proper syntax for functions, data types, and operators. The query_payload object must mirror the query field and include: language (such as "sql" or "nosql"), dialect (the specific database dialect like "postgresql", "mysql", or null if not applicable), statement (the same SQL/query statement as the query field), and parameters (an array of parameter values if the query uses parameterized queries, otherwise an empty array). Both the query and query_payload.statement must be identical and contain the final, executable query with all filters, joins, aggregations, and governance rules applied.
+**QUERY AND QUERY_PAYLOAD CONSTRUCTION**: The query field must contain the complete, executable query statement (SQL, NoSQL, API query, etc.) with all governance rules embedded. The query must use the correct syntax for {databasetype}, including proper syntax for functions, data types, and operators specific to that data source type. The query_payload object must mirror the query field and include: language (such as "sql", "nosql", "soql", "rest", "graphql", "kafka", "kinesis", "vector"), dialect (the specific database dialect like "postgresql", "mysql", or null if not applicable), statement (the same query statement as the query field), and parameters (an array of parameter values if the query uses parameterized queries, otherwise an empty array). Both the query and query_payload.statement must be identical and contain the final, executable query with all filters, joins, aggregations, and governance rules applied.
 
 **GOVERNANCE_APPLIED IN OPERATIONS**: Each operation MUST include a governance_applied object that documents all governance rules enforced in that operation's query. This is CRITICAL for audit trails and compliance verification. The governance_applied object must have two arrays: rls_rules (containing names/descriptions of all applied row-level security rules) and masking_rules (containing names/descriptions of all applied column masking rules). For example, if your query applies a region filter RLS rule and an email masking rule, the governance_applied should be: {{"rls_rules": ["region_filter_for_user_access"], "masking_rules": ["email_mask_for_external_regions"]}}. This documentation ensures that reviewers can verify that all required governance policies were properly enforced.
 
@@ -554,7 +966,7 @@ SECTION 6: EXECUTION PLAN CONSTRUCTION (STEP-BY-STEP DETAILED)
 
 **DEPENDENCIES AND OUTPUT_ARTIFACT**: The dependencies array should list step_ids of operations that must complete before this operation can execute. For the first operation in a plan, dependencies should be an empty array []. For subsequent operations that depend on previous steps, include the step_ids they depend on. The output_artifact field should specify a name for the result of this operation, such as "result_frame", "filtered_customers", or "aggregated_revenue". This helps track data flow through the execution plan.
 
-**SQL CONSTRUCTION BEST PRACTICES**: 
+{f'''**SQL CONSTRUCTION BEST PRACTICES** (Applicable to SQL and Cloud Warehouse databases only):
 
 1. **SQL Dialect Correctness**: Use the exact SQL syntax for {databasetype}. Different databases have different functions (e.g., PostgreSQL uses CONCAT, while SQL Server uses + for string concatenation). Reference the query patterns provided earlier for dialect-specific syntax.
 
@@ -567,8 +979,17 @@ SECTION 6: EXECUTION PLAN CONSTRUCTION (STEP-BY-STEP DETAILED)
 5. **Join Operations**: When joining multiple tables, use explicit JOIN syntax (INNER JOIN, LEFT JOIN) rather than comma-separated tables. Specify join conditions clearly using ON clauses.
 
 6. **Schema Qualification**: Prefix table names with schema names when multiple schemas exist (e.g., public.customers rather than just customers).
+''' if databasetype in ("sql", "cloud_warehouse") else ""}
 
-You MUST build a comprehensive execution plan with detailed operations that include all required fields and proper governance enforcement.
+**OPERATION TYPE-SPECIFIC REQUIREMENTS**: Based on the database category "{databasetype}", you may need to include additional operation-specific objects in your operations:
+
+{_get_operation_type_requirements(databasetype)}
+
+**EXECUTION PLAN TYPE AND STRATEGY SELECTION**:
+- strategy: Use "pushdown" for source-native execution, "internal_compute" for file/format processing with DuckDB/Trino, "hybrid_compute" for multi-source federated queries
+- type: Use "sql_query" for SQL/warehouse, "nosql_query" for NoSQL, "file_query" for file/cloud storage, "api_query" for SaaS/APIs, "stream_query" for streams, "vector_search" for vector databases, "federated_query" for multi-source, "sql_write"/"nosql_write"/"file_write" for write operations
+
+You MUST build a comprehensive execution plan with detailed operations that include all required fields, appropriate operation-specific objects, and proper governance enforcement.
 
 ════════════════════════════════════════════════════════════
 SECTION 7: VISUALIZATION & ANALYTICS ({'REQUIRED' if include_visualization else 'SKIP - Set visualization to null'})
